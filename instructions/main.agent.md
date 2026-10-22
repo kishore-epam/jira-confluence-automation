@@ -17,3 +17,9 @@ Each entry below is an instruction file with a one-line description. Optional su
   + Keywords: validate export, Jira export, Confluence export, source freshness, reporting window
   + When to use: Check local project exports before report preparation; do not access live services or modify source files.
   + Required inputs: Local export files and source type; schema, required columns, and value constraints; reporting period and boundary conventions; time zone; freshness threshold and as-of field.
+- [`./load-jira-export/SKILL.md`](./load-jira-export/SKILL.md) — Load controlled local Jira exports into normalized JSON with validation, freshness, and provenance (test-only).
+  + Keywords: load Jira export, normalized Jira JSON, controlled export, Jira freshness
+- [`./calculate-sprint-metrics/SKILL.md`](./calculate-sprint-metrics/SKILL.md) — Calculate frozen-baseline sprint progress, scope events, and estimate changes (test-only).
+  + Keywords: sprint metrics, sprint progress, committed points, scope additions, scope removals
+- [`./calculate-issue-aging/SKILL.md`](./calculate-issue-aging/SKILL.md) — Calculate business-day update age and continuous in-progress age with explicit evidence (test-only).
+  + Keywords: issue aging, stale issues, business days, in-progress duration
