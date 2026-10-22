@@ -9,6 +9,19 @@
         "-File",
         "${workspaceFolder}/tools/mcp-echo.ps1"
       ]
+    },
+    "workspace-inspector-windows": {
+      "type": "stdio",
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}/tools/mcp-workspace-inspector.ps1",
+        "-WorkspaceRoot",
+        "${workspaceFolder}"
+      ]
     }
   }
 }
