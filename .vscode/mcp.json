@@ -1,0 +1,14 @@
+{
+  "servers": {
+    "echo-windows": {
+      "type": "stdio",
+      "command": "powershell",
+      "args": [
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}/tools/mcp-echo.ps1"
+      ]
+    }
+  }
+}
