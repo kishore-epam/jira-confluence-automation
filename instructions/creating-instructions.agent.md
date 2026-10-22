@@ -136,37 +136,7 @@ Each entry below is an instruction file with a one-line description. Optional su
 
 ## Skills
 
-- Use a **skill** instead of a plain instruction when the workflow includes executable code, reference docs, or reusable assets — not just prose steps.
-- Skills follow the [agentskills.io](https://agentskills.io/what-are-skills) format: a self-contained folder with a required `SKILL.md` and optional sub-folders.
-- When creating skills, I want you to generate scripts that retrieve data from the file system and write it to other files during execution. This is because I want to preserve tokens and minimize hallucinations, so as a model, you should focus less on monitoring the data and rely more on the deterministic script developed within the skill.
-- Create skill under `./instructions/[name]/` where `[name]` follows the same verb-first, hyphen-separated naming as instructions (e.g. `run-migration`, `generate-report`).
-- Required structure:
-  ```
-  instructions/[name]/
-  ├── SKILL.md          # Required: instructions + metadata
-  ├── scripts/          # Optional: executable code (shell, Python, JS, etc.)
-  ├── references/       # Optional: documentation, API specs, guides
-  └── assets/           # Optional: templates, example files, resources
-  ```
-- `SKILL.md` must contain:
-  + Frontmatter block with at minimum `name`, `description`, and `version`:
-    ```markdown
-    ---
-    name: skill-name
-    description: One-line description of what this skill does
-    version: 1.0.0
-    ---
-    ```
-  + Step-by-step instructions in the same bullet-point style as regular instructions.
-  + References to any scripts or assets using relative paths (e.g. `./scripts/run.sh`).
-- Only create sub-folders that are actually needed — do not scaffold empty `scripts/`, `references/`, or `assets/` directories.
-- Add skill to `./instructions/main.agent.md` the same way as a regular instruction, but point to `SKILL.md`:
-  ```markdown
-  - [`./instructions/[name]/SKILL.md`](./[name]/SKILL.md) — one-line description.
-    + Keywords: word1, word2
-  ```
-- For IDE wrappers (VSCode prompts, Cursor rules, Claude commands) reference `./instructions/[name]/SKILL.md` instead of `[name].agent.md`.
-- When a skill grows complex enough to need its own sub-catalog, add `instructions/[name]/main.agent.md` and link it from the root catalog.
+- When asked to create a skill, follow [`./create-agent-skills.agent.md`](./create-agent-skills.agent.md).
 
 ## VSCode + GitHub Copilot
 

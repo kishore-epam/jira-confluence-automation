@@ -7,8 +7,10 @@ Each entry below is an instruction file with a one-line description. Optional su
 
 ---
 
-- [`./creating-instructions.agent.md`](./creating-instructions.agent.md) — Create or update project instructions, catalogs, and IDE integrations.
-  + Keywords: create an instruction, update an instruction, instruction infrastructure, instruction catalog, Copilot prompt
+- [`./creating-instructions.agent.md`](./creating-instructions.agent.md) — Create or update project instructions, catalogs, bootstrap setup, and IDE integrations.
+  + Keywords: create an instruction, update an instruction, instruction infrastructure, instruction catalog, Copilot prompt, bootstrap project instructions
+- [`./create-agent-skills.agent.md`](./create-agent-skills.agent.md) — Create reusable Agent Skills with scripts, metadata, assets, and catalog integration.
+  + Keywords: create a skill, create an agent skill, reusable skill, skill metadata
 - [`./create-status-report.agent.md`](./create-status-report.agent.md) — Generate concise weekly status reports in Markdown with Accomplishments, Blockers, and Next Week sections.
   + Keywords: weekly status report, status update, accomplishments, blockers, next week
 - [`./validate-project-source-exports.agent.md`](./validate-project-source-exports.agent.md) — Validate user-supplied local Jira or Confluence exports against supplied schemas and rules.
