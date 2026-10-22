@@ -1,0 +1,4 @@
+- Important! Always follow the instructions in `./instructions/main.agent.md`.
+- Always load the file completely, not partially.
+- It contains links to other files with instructions.
+- Reload it in every prompt to get the latest instructions.
