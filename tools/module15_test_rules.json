@@ -1,0 +1,4 @@
+{
+  "processor": "normalize_text_processor:process_text",
+  "options": {}
+}

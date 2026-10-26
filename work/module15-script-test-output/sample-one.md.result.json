@@ -1,0 +1,5 @@
+{
+  "source_file": "sample-one.md",
+  "status": "processed",
+  "result": "# Training Sample One\n\nThis generic example demonstrates line cleanup.\nThe processor removes trailing spaces.\n"
+}
