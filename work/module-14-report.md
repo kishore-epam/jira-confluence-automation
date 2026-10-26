@@ -16,14 +16,17 @@ full specification requirement is complete.
 - [ ] Confirm the Jira base URL, project key (`USF-PLAN`), Scrum board ID, and the
   approved read-only account or controlled-export process.
   - Implementation: [MCP + Custom Skill]
+  - GitHub Issue: #2 https://github.com/kishore-epam/jira-confluence-automation/issues/2
 - [ ] Document the Jira workflow status mapping, definition of "in progress,"
   blocker/dependency convention, and sprint scope-change rules.
   - Implementation: [MCP + Custom Skill]
+  - GitHub Issue: #3 https://github.com/kishore-epam/jira-confluence-automation/issues/3
 - [ ] Identify all Git hosting repositories in the project allowlist and define
   how local or hosted repository history will be refreshed.
 - [ ] Identify the approved Confluence space or project-document allowlist;
   explicitly exclude site-wide searches.
   - Implementation: [MCP + Custom Skill]
+  - GitHub Issue: #4 https://github.com/kishore-epam/jira-confluence-automation/issues/4
 - [ ] Identify the capacity-planning product and agree on the controlled
   CSV/XLSX export format, reporting week, units, and aggregation rules.
 - [ ] Locate the PM Excel input template and define required fields, allowed
@@ -241,15 +244,16 @@ full specification requirement is complete.
 ## GitHub Issues
 | Issue URL | Title | Created via MCP? |
 |-----------|-------|-----------------|
-| N/A | No issue was created or verified | No |
-
-No issue URL is present in the backlog, and the personal repository lookup failed, so no issue could be verified or created.
+| https://github.com/kishore-epam/jira-confluence-automation/issues/2 | Confirm the Jira base URL, project key (`USF-PLAN`), Scrum board ID, and the approved read-only account or controlled-export process. | Yes |
+| https://github.com/kishore-epam/jira-confluence-automation/issues/3 | Document the Jira workflow status mapping, definition of "in progress," blocker/dependency convention, and sprint scope-change rules. | Yes |
+| https://github.com/kishore-epam/jira-confluence-automation/issues/4 | Identify the approved Confluence space or project-document allowlist; explicitly exclude site-wide searches. | Yes |
 
 ## MCP Tools Used
 - mcp_github_mcp_se_get_me
-- mcp_github_mcp_se_get_teams
 - mcp_github_mcp_se_search_repositories
-- mcp_github_mcp_se_get_file_contents
 - mcp_github_mcp_se_list_repository_collaborators
 - mcp_github_mcp_se_list_issues
-- mcp_github_mcp_se_create_repository
+- mcp_github_mcp_se_list_issue_types
+- mcp_github_mcp_se_issue_write
+- mcp_github_mcp_se_issue_read
+- mcp_github_mcp_se_sub_issue_write
