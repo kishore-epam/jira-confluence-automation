@@ -28,7 +28,7 @@ This project automates preparation of a concise weekly USF-PLAN status report fo
 - Use read-only integration access to Jira, Git hosting, Confluence, and other source systems unless a separately approved requirement says otherwise.
 - Never commit credentials, access tokens, private keys, or other secrets. Use an organization-approved secret store and keep secrets out of logs, reports, and database fixtures.
 - Request only the access needed for the configured project, repositories, and Confluence locations. Do not scan the entire Confluence site by default.
-- Validate and constrain external input, including API data and controlled CSV/XLSX exports.
+- Validate and constrain external input, including API data and controlled CSV exports. XLSX parsing requires a separately approved specification change.
 - Restrict access to source inputs and generated reports according to organizational policy.
 
 ### 4. Privacy and client-safe output
