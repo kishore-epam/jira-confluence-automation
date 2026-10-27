@@ -13,6 +13,9 @@ const HOST = '127.0.0.1';
 const UI_ORIGIN = 'http://127.0.0.1:5173';
 const PROJECT_KEY = 'USF-PLAN';
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const SOURCE_CLEANUP_INTERVAL_MS = 60 * 1000;
+const SOURCE_RETENTION_SAFETY_MS = SOURCE_CLEANUP_INTERVAL_MS;
 const ROOT = path.resolve(__dirname, '..', '..');
 const INPUT_DIR = path.join(ROOT, 'data', 'inputs');
 const REPORT_DIR = path.join(ROOT, 'data', 'reports');
@@ -118,6 +121,170 @@ function reportingPeriodEnd(now = new Date()) {
   return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}-${String(date.getUTCDate()).padStart(2, '0')}`;
 }
 
+function shiftLocalDate(localDate, days) {
+  const [year, month, day] = localDate.split('-').map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day + days));
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}-${String(date.getUTCDate()).padStart(2, '0')}`;
+}
+
+function easternLocalTimeToUtc(localDate, hour) {
+  const [year, month, day] = localDate.split('-').map(Number);
+  const utcGuess = Date.UTC(year, month - 1, day, hour);
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  });
+  const parts = Object.fromEntries(formatter.formatToParts(new Date(utcGuess))
+    .filter((part) => part.type !== 'literal')
+    .map((part) => [part.type, Number(part.value)]));
+  const localAsUtc = Date.UTC(
+    parts.year,
+    parts.month - 1,
+    parts.day,
+    parts.hour,
+    parts.minute,
+    parts.second,
+  );
+  return new Date(utcGuess - (localAsUtc - utcGuess));
+}
+
+function reportingPeriodBounds(periodEndLocalDate) {
+  const periodStartLocalDate = shiftLocalDate(periodEndLocalDate, -7);
+  return {
+    periodStart: easternLocalTimeToUtc(periodStartLocalDate, 9),
+    periodEnd: easternLocalTimeToUtc(periodEndLocalDate, 9),
+  };
+}
+
+function sourceRetentionDeadline(receivedAt) {
+  return new Date(receivedAt.getTime() + 7 * DAY_MS - SOURCE_RETENTION_SAFETY_MS);
+}
+
+function validateSourceFreshnessAndCoverage({
+  exportedAtUtc,
+  coverageStartUtc,
+  coverageEndUtc,
+  periodEndLocalDate,
+  freshnessDays,
+  sourceType,
+  dataset,
+  activeSprintStartAtUtc = null,
+}) {
+  const { periodStart, periodEnd } = reportingPeriodBounds(periodEndLocalDate);
+  const freshnessCutoff = easternLocalTimeToUtc(
+    shiftLocalDate(periodEndLocalDate, -freshnessDays),
+    9,
+  );
+  const exportedAt = Date.parse(exportedAtUtc);
+  const coverageStart = Date.parse(coverageStartUtc);
+  const coverageEnd = Date.parse(coverageEndUtc);
+
+  if (exportedAt < freshnessCutoff.getTime()) {
+    return {
+      status: 'stale',
+      summary: `Source extraction is older than the configured ${freshnessDays}-calendar-day freshness limit.`,
+    };
+  }
+  if (exportedAt > periodEnd.getTime()) {
+    return {
+      status: 'incomplete',
+      summary: 'Source extraction is later than the scheduled reporting trigger.',
+    };
+  }
+
+  let requiredCoverageStart = periodStart.getTime();
+  if (sourceType === 'jira' && dataset === 'sprint-scope') {
+    if (!activeSprintStartAtUtc || !Number.isFinite(Date.parse(activeSprintStartAtUtc))) {
+      return {
+        status: 'incomplete',
+        summary: 'Current Jira sprint data is unavailable to verify sprint-scope coverage.',
+      };
+    }
+    requiredCoverageStart = Date.parse(activeSprintStartAtUtc);
+  }
+  if (coverageStart > requiredCoverageStart || coverageEnd < periodEnd.getTime()) {
+    return {
+      status: 'incomplete',
+      summary: 'Source coverage does not include the required reporting interval.',
+    };
+  }
+  return { status: 'accepted', summary: null };
+}
+
+async function findCurrentActiveSprintStart(periodEndLocalDate, freshnessDays, db = pool, inputDirectory = INPUT_DIR) {
+  const result = await db.query(
+    `SELECT storage_key, validation_status, exported_at, coverage_start, coverage_end
+     FROM source_inputs
+     WHERE project_id = (SELECT project_id FROM projects WHERE project_key = $1)
+       AND period_end = $2::date AND source_type = 'jira' AND dataset = 'sprints'
+     ORDER BY received_at DESC LIMIT 1`,
+    [PROJECT_KEY, periodEndLocalDate],
+  );
+  const source = result.rows[0];
+  if (!source || source.validation_status !== 'accepted' || !source.storage_key) return null;
+  const sourceStatus = validateSourceFreshnessAndCoverage({
+    exportedAtUtc: source.exported_at,
+    coverageStartUtc: source.coverage_start,
+    coverageEndUtc: source.coverage_end,
+    periodEndLocalDate,
+    freshnessDays,
+    sourceType: 'jira',
+    dataset: 'sprints',
+  });
+  if (sourceStatus.status !== 'accepted') return null;
+
+  const resolvedDirectory = path.resolve(inputDirectory);
+  const filePath = path.resolve(resolvedDirectory, source.storage_key);
+  if (path.dirname(filePath) !== resolvedDirectory) {
+    throw new Error('Stored Jira sprint input has an unsafe storage key.');
+  }
+  let content;
+  try {
+    content = await fs.readFile(filePath);
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+  const parsed = parseCsv(content);
+  const activeSprint = parsed.records.find((row) => row.state.toLowerCase() === 'active');
+  return activeSprint?.start_at_utc || null;
+}
+
+async function purgeExpiredSourceFiles(db = pool, inputDirectory = INPUT_DIR, now = new Date()) {
+  const expired = await db.query(
+    `SELECT source_input_id, storage_key
+     FROM source_inputs
+     WHERE storage_key IS NOT NULL AND retention_until <= $1
+     ORDER BY retention_until`,
+    [now],
+  );
+  const resolvedDirectory = path.resolve(inputDirectory);
+  for (const source of expired.rows) {
+    const filePath = path.resolve(resolvedDirectory, source.storage_key);
+    if (path.dirname(filePath) !== resolvedDirectory) {
+      throw new Error('Expired source input has an unsafe storage key.');
+    }
+    await fs.rm(filePath, { force: true });
+    await db.query(
+      `UPDATE source_inputs SET storage_key = NULL
+       WHERE source_input_id = $1 AND retention_until <= $2`,
+      [source.source_input_id, now],
+    );
+  }
+  return expired.rowCount;
+}
+
+function discardUploadData(sourceType, file, parsed) {
+  if (Buffer.isBuffer(file?.buffer)) file.buffer.fill(0);
+  if (sourceType === 'capacity' && Array.isArray(parsed?.records)) parsed.records.length = 0;
+}
+
 function clientSafeSummary(error) {
   if (error instanceof multer.MulterError && error.code === 'LIMIT_FILE_SIZE') {
     return { status: 413, code: 'UPLOAD_TOO_LARGE', message: 'CSV uploads may not exceed 25 MiB.' };
@@ -220,6 +387,8 @@ app.get('/api/v1/dashboard', async (_req, res, next) => {
     });
   } catch (error) {
     next(error);
+  } finally {
+    discardUploadData(req.params.sourceType, req.file, parsed);
   }
 });
 
@@ -441,7 +610,10 @@ function validateCsvRows(sourceType, dataset, headers, rows, statusMapping = {})
 }
 
 app.post('/api/v1/source-inputs/:sourceType/:dataset', upload.single('file'), async (req, res, next) => {
+  let parsed;
   try {
+    const receivedAt = new Date();
+    const periodEnd = reportingPeriodEnd(receivedAt);
     const { sourceType, dataset } = req.params;
     const metadata = req.body || {};
     if (!req.file || !req.file.originalname.toLowerCase().endsWith('.csv')
@@ -462,8 +634,18 @@ app.post('/api/v1/source-inputs/:sourceType/:dataset', upload.single('file'), as
     if (requiredAttestation && metadata.clientSharingAttested !== 'true') {
       return errorResponse(res, 422, 'ATTESTATION_REQUIRED', 'Confirm that client-sharing flags were reviewed.');
     }
+    const sourceSettings = await pool.query(
+      `SELECT source_freshness_days
+       FROM reporting_settings
+       WHERE project_id = (SELECT project_id FROM projects WHERE project_key = $1)
+       ORDER BY settings_version_id DESC LIMIT 1`,
+      [PROJECT_KEY],
+    );
+    if (!sourceSettings.rowCount) {
+      return errorResponse(res, 503, 'SOURCE_SETTINGS_UNAVAILABLE', 'Configured source freshness settings are required to validate uploads.');
+    }
+    const freshnessDays = sourceSettings.rows[0].source_freshness_days;
 
-    let parsed;
     let validation;
     let issueStatusMapping = {};
     if (sourceType === 'jira' && dataset === 'issues') {
@@ -514,13 +696,31 @@ app.post('/api/v1/source-inputs/:sourceType/:dataset', upload.single('file'), as
         }
       }
     }
-    const accepted = !validationMessage;
+    let activeSprintStartAtUtc = null;
+    if (!validationMessage && sourceType === 'jira' && dataset === 'sprint-scope') {
+      activeSprintStartAtUtc = await findCurrentActiveSprintStart(periodEnd, freshnessDays);
+    }
+    let validationStatus = validationMessage ? 'rejected' : 'accepted';
+    if (!validationMessage) {
+      const freshnessAndCoverage = validateSourceFreshnessAndCoverage({
+        exportedAtUtc: metadata.exportedAtUtc,
+        coverageStartUtc: metadata.coverageStartUtc,
+        coverageEndUtc: metadata.coverageEndUtc,
+        periodEndLocalDate: periodEnd,
+        freshnessDays,
+        sourceType,
+        dataset,
+        activeSprintStartAtUtc,
+      });
+      validationStatus = freshnessAndCoverage.status;
+      validationMessage = freshnessAndCoverage.summary;
+    }
+    const accepted = validationStatus === 'accepted';
     if (accepted && sourceType === 'pm-template'
-      && parsed.records[0].period_end_local_date !== reportingPeriodEnd()) {
+      && parsed.records[0].period_end_local_date !== periodEnd) {
       return errorResponse(res, 422, 'PERIOD_MISMATCH', 'The PM template period does not match the current reporting period.');
     }
     const hash = crypto.createHash('sha256').update(req.file.buffer).digest('hex');
-    const periodEnd = reportingPeriodEnd();
     const inputId = crypto.randomUUID();
     let storageKey = null;
     if (accepted && sourceType !== 'capacity' && sourceType !== 'pm-template') {
@@ -550,10 +750,10 @@ app.post('/api/v1/source-inputs/:sourceType/:dataset', upload.single('file'), as
         [
           inputId, projectId, periodEnd, sourceType, dataset, storageKey, hash,
           metadata.exportedAtUtc, metadata.coverageStartUtc, metadata.coverageEndUtc,
-          accepted ? 'accepted' : 'rejected',
+          validationStatus,
           validationMessage || 'CSV structure validated; detailed source row checks are limited in this prototype.',
-          requiredAttestation ? new Date() : null,
-          storageKey ? new Date(Date.now() + 7 * 86400000) : null,
+          requiredAttestation ? receivedAt : null,
+          storageKey ? sourceRetentionDeadline(receivedAt) : null,
           prior.rows[0]?.source_input_id || null,
         ],
       );
@@ -596,6 +796,7 @@ app.post('/api/v1/source-inputs/:sourceType/:dataset', upload.single('file'), as
     res.status(accepted ? 201 : 422).json({
       sourceInputId: inputId,
       accepted,
+      status: validationStatus,
       validationSummary: validationMessage || 'CSV structure validated.',
     });
   } catch (error) {
@@ -890,6 +1091,13 @@ async function start() {
   await fs.mkdir(INPUT_DIR, { recursive: true });
   await fs.mkdir(REPORT_DIR, { recursive: true });
   await pool.query(await fs.readFile(schemaPath, 'utf8'));
+  await purgeExpiredSourceFiles();
+  const cleanupTimer = setInterval(() => {
+    purgeExpiredSourceFiles().catch((error) => {
+      console.error(JSON.stringify({ event: 'source_retention_cleanup_failed', code: error.code || 'CLEANUP_FAILED' }));
+    });
+  }, SOURCE_CLEANUP_INTERVAL_MS);
+  cleanupTimer.unref();
   app.listen(PORT, HOST, () => {
     console.log(`USF-PLAN API listening at http://${HOST}:${PORT}`);
   });
@@ -902,4 +1110,17 @@ if (require.main === module) {
   });
 }
 
-module.exports = { app, pool, parseCsv, reportingPeriodEnd, validateCsvRows, validateUpdate };
+module.exports = {
+  app,
+  pool,
+  parseCsv,
+  reportingPeriodEnd,
+  reportingPeriodBounds,
+  sourceRetentionDeadline,
+  validateSourceFreshnessAndCoverage,
+  findCurrentActiveSprintStart,
+  purgeExpiredSourceFiles,
+  discardUploadData,
+  validateCsvRows,
+  validateUpdate,
+};

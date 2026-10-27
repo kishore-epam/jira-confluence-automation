@@ -50,13 +50,20 @@ CREATE TABLE IF NOT EXISTS source_inputs (
     exported_at TIMESTAMPTZ NOT NULL,
     coverage_start TIMESTAMPTZ NOT NULL,
     coverage_end TIMESTAMPTZ NOT NULL,
-    validation_status TEXT NOT NULL CHECK (validation_status IN ('accepted', 'rejected')),
+    validation_status TEXT NOT NULL,
     validation_summary TEXT NOT NULL,
     client_sharing_attested_at TIMESTAMPTZ,
     retention_until TIMESTAMPTZ,
     received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     supersedes_source_input_id UUID REFERENCES source_inputs(source_input_id)
 );
+
+ALTER TABLE source_inputs
+    DROP CONSTRAINT IF EXISTS source_inputs_validation_status_check;
+
+ALTER TABLE source_inputs
+    ADD CONSTRAINT source_inputs_validation_status_check
+    CHECK (validation_status IN ('accepted', 'rejected', 'stale', 'incomplete'));
 
 CREATE INDEX IF NOT EXISTS source_inputs_period_idx
     ON source_inputs (project_id, period_end, source_type, dataset, received_at DESC);
