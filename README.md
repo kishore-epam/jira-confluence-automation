@@ -4,56 +4,62 @@ The local prototype uses PostgreSQL 15, an Express API, and a React/Vite UI. It 
 loopback-only and accepts controlled CSV exports; it does not connect to Jira or
 Confluence directly, email reports, or provide a manual report-generation action.
 
-## Start the local application (Windows)
+## Local API and database startup (Windows)
 
-1. Start Docker Desktop.
-2. From the repository root, start the database using the approved Credential
-   Manager entry:
+Register the API/database startup task for the dedicated signed-in account.
+Preview first; `-WhatIf` does not register or change a Windows task:
 
-   ```powershell
-   powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\start-local-database.ps1
-   ```
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\register-local-startup-task.ps1 -WhatIf
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\register-local-startup-task.ps1
+```
 
-3. In a separate PowerShell terminal, start the API. The wrapper reads the
-   PostgreSQL credential without placing it in a command line or log:
+At user logon, the task runs `start-local-services-on-logon.ps1`, which starts
+Docker Compose PostgreSQL using Windows Credential Manager and then starts the
+Express API using its local credential wrapper. Start Docker Desktop before
+signing in. The Vite UI remains on demand:
 
-   ```powershell
-   powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\start-local-backend.ps1
-   ```
+```powershell
+npm --prefix frontend run dev
+```
 
-4. In a third terminal, start the Vite UI:
-
-   ```powershell
-   npm --prefix frontend run dev
-   ```
-
-5. Open <http://127.0.0.1:5173>. The API health check is
-   <http://127.0.0.1:3000/healthz>.
+Open <http://127.0.0.1:5173>. The API health check is
+<http://127.0.0.1:3000/healthz>.
 
 The backend startup wrapper applies local ACLs to `data\inputs`, `data\reports`,
-and `data\logs`. Keep all three services on this machine; do not bind them to a
-LAN interface.
+and `data\logs`. Keep all services on this machine; do not bind them to a LAN
+interface.
 
 ## Windows scheduled worker
 
-Use the Task Scheduler wrapper to install the weekly report worker in the
-project-manager session:
+The Windows time zone must be **Eastern Standard Time (US & Canada)** before
+registering the worker task. Its daylight-saving rules align the weekly 09:00
+trigger with `America/New_York`; registration refuses to create the task under a
+different local time zone. The task runs interactively as the signed-in project
+manager and does not start when an occurrence was missed.
+
+Preview before registering:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\register-local-worker-task.ps1 -WhatIf
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\register-local-worker-task.ps1
 ```
 
-The task runs every Monday at 09:00 in `America/New_York`, without replaying
-missed triggers. The task reads the worker secret from the `USF-PLAN/WorkerToken`
-Credential Manager entry and fails safely if Docker, the loopback API, or the
-required Python/runtime prerequisites are unavailable.
+The worker wrapper derives the scheduled occurrence's UTC trigger and local
+period-end date, then passes both to the report worker so an allowed retry can
+retain the original anchor. It retrieves the worker token from the
+`USF-PLAN/WorkerToken` Credential Manager entry without placing it on the command
+line.
+
+The runnable `scripts\report-worker.py` workflow and period-scoped Jira input
+snapshot are not implemented. The wrapper fails safely rather than reporting
+success when that worker is absent. Worker/report integration is blocked on
+T-028; the schedule and local startup orchestration do not complete reports.
 
 ## Current prototype boundary
 
 The UI supports saving PM update revisions, reviewing source readiness,
 submitting CSVs for contract validation, versioning basic reporting thresholds,
-and inspecting report history. The scheduled worker is now registered through the
-Windows Task Scheduler wrapper, but the Python report-generation implementation
-remains a separate runtime dependency. The UI intentionally does not offer a
-manual “run now” operation.
+and inspecting report history. Windows startup and scheduled-task orchestration
+are available, but report-worker integration remains incomplete. The UI
+intentionally does not offer a manual “run now” operation.

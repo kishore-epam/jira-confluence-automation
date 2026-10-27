@@ -71,6 +71,131 @@ test('the Windows worker task schedules Monday 9:00 a.m. ET and skips missed run
   }), /Monday at 09:00 America\/New_York/);
 });
 
+test('T-025 startup task and weekly worker definitions stay interactive and skip missed occurrences', {
+  skip: process.platform !== 'win32' && 'Windows Task Scheduler is only supported on Windows',
+}, () => {
+  const scriptsDirectory = path.resolve(__dirname, '..', '..', 'scripts');
+  const powershell = 'powershell.exe';
+  const describeTask = (scriptName) => {
+    const result = spawnSync(powershell, [
+      '-NoProfile',
+      '-ExecutionPolicy', 'Bypass',
+      '-File', path.join(scriptsDirectory, scriptName),
+      '-DescribeOnly',
+    ], { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    return JSON.parse(result.stdout.trim());
+  };
+
+  const startup = describeTask('register-local-startup-task.ps1');
+  assert.equal(startup.trigger, 'AtLogOn');
+  assert.equal(startup.logonType, 'Interactive');
+  assert.deepEqual(startup.starts, ['PostgreSQL', 'Express API']);
+  assert.equal(startup.viteStartsOnDemand, true);
+
+  const startupPreview = spawnSync(powershell, [
+    '-NoProfile',
+    '-ExecutionPolicy', 'Bypass',
+    '-File', path.join(scriptsDirectory, 'start-local-services-on-logon.ps1'),
+    '-WhatIf',
+  ], { encoding: 'utf8' });
+  assert.equal(startupPreview.status, 0, startupPreview.stderr);
+  assert.match(startupPreview.stdout, /Would start PostgreSQL .* then start the Express API/);
+
+  const worker = describeTask('register-local-worker-task.ps1');
+  assert.equal(worker.trigger, 'Weekly Monday 09:00');
+  assert.equal(worker.timeZone, 'America/New_York');
+  assert.equal(worker.requiresEasternSystemTimeZone, true);
+  assert.equal(worker.logonType, 'Interactive');
+  assert.equal(worker.startWhenAvailable, false);
+  assert.equal(worker.missedTriggerBehavior, 'DoNotStartWhenAvailable');
+  assert.equal(worker.multipleInstances, 'IgnoreNew');
+});
+
+test('T-025 worker wrapper keeps the scheduled trigger as its report-period anchor', {
+  skip: process.platform !== 'win32' && 'The scheduled worker wrapper requires Windows',
+}, () => {
+  const workerScript = path.resolve(__dirname, '..', '..', 'scripts', 'run-local-report-worker.ps1');
+  const result = spawnSync('powershell.exe', [
+    '-NoProfile',
+    '-ExecutionPolicy', 'Bypass',
+    '-File', workerScript,
+    '-ScheduledTriggerUtc', '2026-11-02T14:00:00Z',
+    '-WhatIf',
+  ], { encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
+  const planLine = result.stdout.split(/\r?\n/).find((line) => line.trimStart().startsWith('{'));
+  assert.ok(planLine, result.stdout);
+  const plan = JSON.parse(planLine);
+  assert.equal(plan.periodEndLocalDate, '2026-11-02');
+  assert.equal(plan.scheduledTriggerUtc, '2026-11-02T14:00:00Z');
+  assert.deepEqual(plan.workerArguments, [
+    '--period-end-local-date', '2026-11-02',
+    '--scheduled-trigger-utc', '2026-11-02T14:00:00Z',
+  ]);
+  assert.equal(plan.timeZone, 'America/New_York');
+  assert.equal(plan.missedTriggerBehavior, 'DoNotStartWhenAvailable');
+
+  for (const [scheduledTriggerUtc, expectedPeriodEnd] of [
+    ['2026-03-09T13:00:00Z', '2026-03-09'],
+    ['2026-11-02T14:00:00Z', '2026-11-02'],
+  ]) {
+    const validTrigger = spawnSync('powershell.exe', [
+      '-NoProfile',
+      '-ExecutionPolicy', 'Bypass',
+      '-File', workerScript,
+      '-ScheduledTriggerUtc', scheduledTriggerUtc,
+      '-WhatIf',
+    ], { encoding: 'utf8' });
+    assert.equal(validTrigger.status, 0, validTrigger.stderr);
+    const validPlanLine = validTrigger.stdout.split(/\r?\n/).find((line) => line.trimStart().startsWith('{'));
+    assert.ok(validPlanLine, validTrigger.stdout);
+    assert.equal(JSON.parse(validPlanLine).periodEndLocalDate, expectedPeriodEnd);
+  }
+
+  const computed = spawnSync('powershell.exe', [
+    '-NoProfile',
+    '-ExecutionPolicy', 'Bypass',
+    '-File', workerScript,
+    '-WhatIf',
+  ], { encoding: 'utf8' });
+  assert.equal(computed.status, 0, computed.stderr);
+  const computedPlanLine = computed.stdout.split(/\r?\n/).find((line) => line.trimStart().startsWith('{'));
+  assert.ok(computedPlanLine, computed.stdout);
+  const computedPlan = JSON.parse(computedPlanLine);
+  const computedTrigger = new Date(computedPlan.scheduledTriggerUtc);
+  const easternParts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    weekday: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(computedTrigger);
+  const eastern = Object.fromEntries(easternParts.filter((part) => part.type !== 'literal').map((part) => [part.type, part.value]));
+  assert.equal(eastern.weekday, 'Mon');
+  assert.equal(eastern.hour, '09');
+  assert.equal(eastern.minute, '00');
+
+  const invalid = spawnSync('powershell.exe', [
+    '-NoProfile',
+    '-ExecutionPolicy', 'Bypass',
+    '-File', workerScript,
+    '-ScheduledTriggerUtc', '2026-11-03T14:00:00Z',
+    '-WhatIf',
+  ], { encoding: 'utf8' });
+  assert.notEqual(invalid.status, 0);
+  assert.match(invalid.stderr, /Monday 09:00 America\/New_York scheduled trigger/);
+
+  const missingWorker = spawnSync('powershell.exe', [
+    '-NoProfile',
+    '-ExecutionPolicy', 'Bypass',
+    '-File', workerScript,
+    '-ScheduledTriggerUtc', '2026-11-02T14:00:00Z',
+  ], { encoding: 'utf8' });
+  assert.notEqual(missingWorker.status, 0);
+  assert.match(missingWorker.stderr.replace(/\s+/g, ' '), /report-worker integration is blocked on T-028/i);
+});
+
 test('reporting period UTC boundaries preserve seven local calendar days across DST', () => {
   const springPeriod = reportingPeriodBounds('2026-03-09');
   const fallPeriod = reportingPeriodBounds('2026-11-02');
