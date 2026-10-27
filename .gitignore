@@ -7,6 +7,9 @@
 !.env.example
 !.env.*.example
 
+# Node package dependencies.
+node_modules/
+
 # Python caches and virtual environments.
 __pycache__/
 *.py[cod]

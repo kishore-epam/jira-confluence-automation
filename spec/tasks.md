@@ -25,7 +25,8 @@ Tasks are sequenced by the phases in [plan.md](./plan.md). Each task has a title
 **Acceptance criteria:**
 - `.nvmrc` contains `24.22.1`; the backend package declares the Node 24 engine line.
 - Express is pinned to `5.3.0` and dependency versions are reproducible from the committed lockfile.
-- A clean dependency install and backend startup succeed on the supported Windows environment.
+- A clean `npm ci` succeeds on the supported Windows environment, and `npm ls --depth=0` reports the pinned Express dependency without errors.
+- The backend package's Node.js and Express versions match the specified values. HTTP server startup and `/healthz` verification are performed in T-005 after the Express application entry point exists.
 - No credentials or machine-specific secret values are added to tracked files.
 
 **Dependencies:** T-001.
