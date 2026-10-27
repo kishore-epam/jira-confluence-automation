@@ -38,7 +38,7 @@ Tasks are sequenced by the phases in [plan.md](./plan.md). Each task has a title
 **Acceptance criteria:**
 - `docker-compose.yml` runs only the official `postgres:15` image with a named data volume.
 - The database port is bound only to `127.0.0.1:5432`.
-- The startup wrapper retrieves database credentials from Windows Credential Manager and passes them to the local Compose process without `.env` files, committed defaults, shell-history writes, or logging values.
+- `scripts/start-local-database.ps1` retrieves the PostgreSQL username/password from the Windows Credential Manager Generic Credential target `USF-PLAN/PostgreSQL` and passes them to the local Compose process without `.env` files, committed defaults, shell-history writes, command-line password arguments, or logging values.
 - PostgreSQL starts, persists data in its named volume, and is reachable only through loopback.
 
 **Dependencies:** T-001.
