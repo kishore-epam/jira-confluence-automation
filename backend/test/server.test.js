@@ -1,8 +1,10 @@
 'use strict';
 
+const { spawnSync } = require('node:child_process');
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
+const nodeFs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const {
@@ -21,6 +23,8 @@ const {
   calculateSprintProgress,
   calculateMilestoneHealth,
   calculateGitActivity,
+  buildReportDeckSlides,
+  generatePowerPointReport,
   requireWorkerToken,
   claimReportRun,
   heartbeatReportRun,
@@ -662,6 +666,69 @@ test('Jira milestones reject duplicate keys, bad dates, bad timestamps, bad shar
   assert.match(validateCsvRows('jira', 'milestones', ['milestone_id', 'name', 'status', 'due_date_local', 'client_shareable'], [
     { milestone_id: '1', name: 'Beta', status: 'Done', due_date_local: '2026-11-15', client_shareable: 'true' },
   ]), /columns do not match/i);
+});
+
+test('six-slide report deck is deterministic and uses the required ordered sections', async () => {
+  const snapshot = {
+    projectKey: 'USF-PLAN',
+    periodStartLocalDate: '2026-10-26',
+    periodEndLocalDate: '2026-11-02',
+    ragStatus: 'amber',
+    ragRationale: 'Team momentum is solid, but source freshness and dependency closure need attention.',
+    accomplishments: ['Completed sprint planning and issue cleanup.'],
+    topAttentionItems: ['Resolve dependency on Jira sprint-scope coverage.', 'Refresh stale Confluence references.'],
+    sprint: {
+      name: 'Sprint 13',
+      committedPoints: 31,
+      completedPoints: 19,
+      remainingPoints: 12,
+      additions: ['USF-14 +3'],
+      removals: ['USF-8 -2'],
+      caveats: ['Estimate history for one issue is partial.'],
+    },
+    milestones: [
+      { milestoneKey: 'M-1', status: 'on_track', summary: 'Release candidate is on track.' },
+    ],
+    issues: [
+      { issueKey: 'USF-21', status: 'in_progress', age: '7 business days', summary: 'Needs dependency confirmation.' },
+    ],
+    blockers: [{ issueKey: 'USF-21', status: 'blocked', summary: 'Waiting on API contract sign-off.' }],
+    decisions: [{ issueKey: 'Decision', status: 'open', summary: 'Need sponsor review for scope change.' }],
+    capacity: { plannedHours: 32.5, actualHours: 28.0 },
+    gitActivity: { count: 14 },
+    sourceWarnings: ['Jira sprint-scope coverage is partial.'],
+    confluenceRefs: [{ title: 'Project scope', summary: 'Approved summary for the current sprint.' }],
+    nextWeekPriorities: ['Complete dependency sign-off.', 'Refresh stale export set.'],
+  };
+
+  const slides = buildReportDeckSlides(snapshot);
+  assert.equal(slides.length, 6);
+  assert.deepEqual(slides.map((slide) => slide.title), [
+    'Executive summary',
+    'Sprint progress and scope',
+    'Milestones and forecast availability',
+    'Issues, blockers, dependencies, and decisions',
+    'Aggregate capacity and Git activity',
+    'Next-week priorities and data quality',
+  ]);
+  assert.match(slides[0].body.join(' '), /RAG status: amber/i);
+  assert.match(slides[5].body.join(' '), /Next-week priorities/i);
+
+  const tmpDir = path.join(os.tmpdir(), `usf-plan-pptx-${Date.now()}`);
+  const firstPath = path.join(tmpDir, 'report-a.pptx');
+  const secondPath = path.join(tmpDir, 'report-b.pptx');
+  const firstReport = generatePowerPointReport(snapshot, firstPath);
+  const secondReport = generatePowerPointReport(snapshot, secondPath);
+  assert.equal(firstReport, firstPath);
+  assert.equal(secondReport, secondPath);
+  assert.equal(nodeFs.readFileSync(firstPath).equals(nodeFs.readFileSync(secondPath)), true);
+
+  const python = process.platform === 'win32' ? 'py' : 'python3';
+  const slideCount = spawnSync(python, ['-c', `from pptx import Presentation; prs = Presentation(r'${firstPath}'); print(len(prs.slides))`], { encoding: 'utf8' });
+  assert.equal(Number(slideCount.stdout.trim()), 6);
+  assert.match(slideCount.stdout, /6/);
+  assert.equal(nodeFs.existsSync(firstPath), true);
+  await fs.rm(tmpDir, { recursive: true, force: true });
 });
 
 test('capacity import returns an aggregate without retaining the person key', () => {

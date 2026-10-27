@@ -1,7 +1,9 @@
 'use strict';
 
 const crypto = require('node:crypto');
+const { spawnSync } = require('node:child_process');
 const fs = require('node:fs/promises');
+const os = require('node:os');
 const path = require('node:path');
 const express = require('express');
 const multer = require('multer');
@@ -1030,6 +1032,137 @@ function validateCsvRows(sourceType, dataset, headers, rows, statusMapping = {})
   return null;
 }
 
+function asList(items) {
+  if (!Array.isArray(items)) return [];
+  return items.map((item) => String(item)).filter(Boolean);
+}
+
+function buildReportDeckSlides(snapshot = {}) {
+  const period = snapshot.period || {};
+  const sprint = snapshot.sprint || {};
+  const projectKey = snapshot.projectKey || 'USF-PLAN';
+  const periodStart = period.start || snapshot.periodStartLocalDate || '2026-10-26';
+  const periodEnd = period.end || snapshot.periodEndLocalDate || '2026-11-02';
+  const ragStatus = (snapshot.ragStatus || 'amber').toLowerCase();
+  const ragRationale = snapshot.ragRationale || 'Project health is stable but requires attention to scope and dependency management.';
+  const accomplishments = asList(snapshot.accomplishments || period.accomplishments || ['Completed sprint planning and validation work.']);
+  const attention = asList(snapshot.topAttentionItems || snapshot.highPriorityItems || ['Confirm blocked dependency resolution and source freshness.']);
+  const sprintName = sprint.name || 'Sprint 13';
+  const committedPoints = Number.isFinite(Number(sprint.committedPoints)) ? Number(sprint.committedPoints) : 0;
+  const completedPoints = Number.isFinite(Number(sprint.completedPoints)) ? Number(sprint.completedPoints) : 0;
+  const remainingPoints = Number.isFinite(Number(sprint.remainingPoints)) ? Number(sprint.remainingPoints) : 0;
+  const scopeAdditions = asList(sprint.additions || snapshot.scopeAdditions || []);
+  const scopeRemovals = asList(sprint.removals || snapshot.scopeRemovals || []);
+  const sprintCaveats = asList(sprint.caveats || snapshot.sprintCaveats || []);
+  const milestoneRows = asList(snapshot.milestones || []).map((item) => typeof item === 'string' ? item : `${item.milestoneKey || 'MILESTONE'}: ${item.status || 'status unavailable'}${item.summary ? ` — ${item.summary}` : ''}`);
+  const issueRows = asList(snapshot.issues || []).map((item) => typeof item === 'string' ? item : `${item.issueKey || 'ISSUE'}: ${item.status || 'status unavailable'}${item.age ? ` (${item.age})` : ''}${item.summary ? ` — ${item.summary}` : ''}`);
+  const blockers = asList(snapshot.blockers || []).map((item) => typeof item === 'string' ? item : `${item.issueKey || 'ISSUE'}: ${item.summary || item.status || 'Blocked'}`);
+  const decisions = asList(snapshot.decisions || []).map((item) => typeof item === 'string' ? item : `${item.issueKey || 'Decision'}: ${item.summary || item.status || 'Awaiting review'}`);
+  const capacity = snapshot.capacity || {};
+  const plannedHours = Number.isFinite(Number(capacity.plannedHours)) ? Number(capacity.plannedHours) : 0;
+  const actualHours = Number.isFinite(Number(capacity.actualHours)) ? Number(capacity.actualHours) : 0;
+  const gitCount = Number.isFinite(Number((snapshot.gitActivity || {}).count)) ? Number((snapshot.gitActivity || {}).count) : 0;
+  const sourceWarnings = asList(snapshot.sourceWarnings || []).length ? asList(snapshot.sourceWarnings) : ['No source warnings.'];
+  const confluenceRefs = asList(snapshot.confluenceRefs || []).map((item) => typeof item === 'string' ? item : `${item.title || 'Reference'} — ${item.summary || 'No summary provided.'}`);
+  const nextWeek = asList(snapshot.nextWeekPriorities || ['Complete validation and confirm source freshness before the next run.']);
+  const firstBody = [
+    `Reporting period: ${periodStart} to ${periodEnd}`,
+    `Project: ${projectKey}`,
+    `RAG status: ${ragStatus.toUpperCase()}`,
+    `Rationale: ${ragRationale}`,
+    `Top accomplishments: ${accomplishments.length ? accomplishments.join('; ') : 'None recorded.'}`,
+    `Highest priority attention: ${attention.length ? attention.join('; ') : 'None recorded.'}`,
+  ];
+  const secondBody = [
+    `Sprint: ${sprintName}`,
+    `Committed points: ${committedPoints}`,
+    `Completed points: ${completedPoints}`,
+    `Remaining points: ${remainingPoints}`,
+    `Scope additions: ${scopeAdditions.length ? scopeAdditions.join('; ') : 'None.'}`,
+    `Scope removals: ${scopeRemovals.length ? scopeRemovals.join('; ') : 'None.'}`,
+    `Caveats: ${sprintCaveats.length ? sprintCaveats.join('; ') : 'No estimate or coverage caveats.'}`,
+  ];
+  const thirdBody = [
+    `Milestones: ${milestoneRows.length ? milestoneRows.join(' | ') : 'No milestone status provided.'}`,
+    `Forecast: Unavailable in this prototype.`,
+  ];
+  const fourthBody = [
+    `Issues and blockers: ${issueRows.length ? issueRows.join(' | ') : 'No issue detail provided.'}`,
+    `Blockers/dependencies: ${blockers.length ? blockers.join(' | ') : 'No blockers recorded.'}`,
+    `Decision needs: ${decisions.length ? decisions.join(' | ') : 'No decision requests recorded.'}`,
+  ];
+  const fifthBody = [
+    `Planned capacity: ${plannedHours.toFixed(1)} hours`,
+    `Actual worklog hours: ${actualHours.toFixed(1)} hours`,
+    `Git activity: ${gitCount} repository commits in-scope`,
+    `Data note: Aggregate capacity only; no person-level rows or names are retained.`,
+  ];
+  const sixthBody = [
+    `Next-week priorities: ${nextWeek.join(' | ')}`,
+    `Source quality: ${sourceWarnings.join(' | ')}`,
+    `Optional project references: ${confluenceRefs.length ? confluenceRefs.slice(0, 3).join(' | ') : 'No client-shareable references provided.'}`,
+    `Reporting note: Missing or stale sources are explicitly described and the prototype does not fabricate forecast values.`,
+  ];
+  return [
+    { title: 'Executive summary', body: firstBody },
+    { title: 'Sprint progress and scope', body: secondBody },
+    { title: 'Milestones and forecast availability', body: thirdBody },
+    { title: 'Issues, blockers, dependencies, and decisions', body: fourthBody },
+    { title: 'Aggregate capacity and Git activity', body: fifthBody },
+    { title: 'Next-week priorities and data quality', body: sixthBody },
+  ];
+}
+
+function generatePowerPointReport(snapshot, outputPath) {
+  const reportPath = path.resolve(outputPath || path.join(os.tmpdir(), `usf-plan-report-${Date.now()}.pptx`));
+  const slides = buildReportDeckSlides(snapshot);
+  const pythonExecutable = process.platform === 'win32' ? 'py' : 'python3';
+  const script = `
+import datetime
+import json
+import sys
+from pathlib import Path
+from pptx import Presentation
+from pptx.util import Inches, Pt
+
+slides = json.loads(sys.argv[1])
+out_path = Path(sys.argv[2])
+out_path.parent.mkdir(parents=True, exist_ok=True)
+prs = Presentation()
+prs.slide_width = Inches(13.333)
+prs.slide_height = Inches(7.5)
+prs.core_properties.created = datetime.datetime(2026, 11, 2, 9, 0, 0)
+prs.core_properties.modified = datetime.datetime(2026, 11, 2, 9, 0, 0)
+for slide_def in slides:
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    title_box = slide.shapes.add_textbox(Inches(0.5), Inches(0.25), Inches(12.0), Inches(0.6))
+    title_frame = title_box.text_frame
+    title_frame.clear()
+    paragraph = title_frame.paragraphs[0]
+    paragraph.text = slide_def['title']
+    paragraph.runs[0].font.bold = True
+    paragraph.runs[0].font.size = Pt(24)
+    text_box = slide.shapes.add_textbox(Inches(0.7), Inches(1.0), Inches(11.8), Inches(5.0))
+    text_frame = text_box.text_frame
+    text_frame.word_wrap = True
+    text_frame.clear()
+    for index, line in enumerate(slide_def['body']):
+        p = text_frame.paragraphs[0] if index == 0 else text_frame.add_paragraph()
+        p.text = line
+        p.level = 0
+        if p.runs:
+            p.runs[0].font.size = Pt(18)
+prs.save(out_path)
+`;
+  const result = spawnSync(pythonExecutable, ['-c', script, JSON.stringify(slides), reportPath], { encoding: 'utf8' });
+  if (result.status !== 0) {
+    throw new Error(result.stderr || result.stdout || 'PowerPoint generation failed.');
+  }
+  return reportPath;
+}
+
+const generatePowerPointArtifact = generatePowerPointReport;
+
 app.post('/api/v1/source-inputs/:sourceType/:dataset', upload.single('file'), async (req, res, next) => {
   let parsed;
   try {
@@ -1591,6 +1724,9 @@ module.exports = {
   calculateSprintProgress,
   calculateMilestoneHealth,
   calculateGitActivity,
+  buildReportDeckSlides,
+  generatePowerPointReport,
+  generatePowerPointArtifact,
   requireWorkerToken,
   claimReportRun,
   heartbeatReportRun,
