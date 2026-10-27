@@ -162,6 +162,161 @@ function reportingPeriodBounds(periodEndLocalDate) {
   };
 }
 
+function calculateBusinessDayAge(lastUpdatedLocalDate, reportEndLocalDate) {
+  if (!validDate(lastUpdatedLocalDate) || !validDate(reportEndLocalDate)) return null;
+  const start = new Date(`${lastUpdatedLocalDate}T00:00:00Z`);
+  const end = new Date(`${reportEndLocalDate}T00:00:00Z`);
+  if (end < start) return 0;
+  let count = 0;
+  const cursor = new Date(start.getTime());
+  cursor.setUTCDate(cursor.getUTCDate() + 1);
+  while (cursor <= end) {
+    const day = cursor.getUTCDay();
+    if (day >= 1 && day <= 5) count += 1;
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+  return count;
+}
+
+function calculateInProgressAge(transitionAtUtc, reportEndUtc) {
+  if (!transitionAtUtc || !validUtcTimestamp(transitionAtUtc) || !validUtcTimestamp(reportEndUtc)) return null;
+  const startMs = Date.parse(transitionAtUtc);
+  const endMs = Date.parse(reportEndUtc);
+  if (endMs < startMs) return 0;
+  return Math.max(0, Math.round((endMs - startMs) / DAY_MS));
+}
+
+function calculateSprintProgress(scopeRows, sprintStartUtc, reportEndUtc) {
+  if (!Array.isArray(scopeRows) || !scopeRows.length) {
+    return { committedPoints: null, completedPoints: null, remainingPoints: null, status: 'unavailable', warnings: ['Sprint scope is unavailable.'] };
+  }
+  const sprintStartMs = Date.parse(sprintStartUtc);
+  const reportEndMs = Date.parse(reportEndUtc);
+  if (!Number.isFinite(sprintStartMs) || !Number.isFinite(reportEndMs)) {
+    return { committedPoints: null, completedPoints: null, remainingPoints: null, status: 'unavailable', warnings: ['Sprint window is invalid.'] };
+  }
+
+  const issues = new Map();
+  let hasMissingBaseline = false;
+  let hasMissingCurrent = false;
+  let hasInvalidHistory = false;
+
+  for (const row of scopeRows) {
+    if (!row || !row.issue_key || !validUtcTimestamp(row.added_at_utc)) {
+      hasInvalidHistory = true;
+      continue;
+    }
+    const key = row.issue_key;
+    const existing = issues.get(key) || {
+      baselinePoints: null,
+      currentPoints: null,
+      completed: false,
+      activeAtReportEnd: false,
+    };
+    const addedAtMs = Date.parse(row.added_at_utc);
+    const removedAtMs = row.removed_at_utc && validUtcTimestamp(row.removed_at_utc) ? Date.parse(row.removed_at_utc) : Infinity;
+    const activeAtSprintStart = addedAtMs <= sprintStartMs && sprintStartMs < removedAtMs;
+    const activeAtReportEnd = addedAtMs <= reportEndMs && reportEndMs < removedAtMs;
+
+    if (activeAtSprintStart) {
+      if (row.story_points_at_sprint_start === '' || !Number.isFinite(Number(row.story_points_at_sprint_start)) || Number(row.story_points_at_sprint_start) < 0) {
+        hasMissingBaseline = true;
+      } else {
+        existing.baselinePoints = Number(row.story_points_at_sprint_start);
+      }
+    }
+    if (row.story_points_current === '' || !Number.isFinite(Number(row.story_points_current)) || Number(row.story_points_current) < 0) {
+      hasMissingCurrent = true;
+    } else {
+      existing.currentPoints = Number(row.story_points_current);
+    }
+    if (row.completed_at_utc && validUtcTimestamp(row.completed_at_utc) && Date.parse(row.completed_at_utc) <= reportEndMs) {
+      existing.completed = true;
+    }
+    if (activeAtReportEnd) {
+      existing.activeAtReportEnd = true;
+    }
+    issues.set(key, existing);
+  }
+
+  let committedPoints = 0;
+  let completedPoints = 0;
+  let remainingPoints = 0;
+  for (const state of issues.values()) {
+    if (state.baselinePoints !== null) committedPoints += state.baselinePoints;
+    if (state.completed && state.currentPoints !== null) completedPoints += state.currentPoints;
+    if (state.activeAtReportEnd && !state.completed && state.currentPoints !== null) remainingPoints += state.currentPoints;
+  }
+
+  const warnings = [];
+  if (hasInvalidHistory) warnings.push('Incomplete sprint-scope membership history.');
+  if (hasMissingBaseline) warnings.push('One or more sprint baseline points are unavailable.');
+  if (hasMissingCurrent) warnings.push('One or more current estimates are unavailable.');
+
+  return {
+    committedPoints,
+    completedPoints,
+    remainingPoints,
+    status: warnings.length ? 'partial' : 'available',
+    warnings,
+  };
+}
+
+function calculateMilestoneHealth(milestones, reportEndLocalDate, statusMapping = {}) {
+  if (!Array.isArray(milestones)) return [];
+  const results = [];
+  for (const milestone of milestones) {
+    if (!milestone || !milestone.milestone_key) {
+      results.push({ milestoneKey: null, status: 'unavailable', reason: 'Missing milestone identity.' });
+      continue;
+    }
+    const dueDate = milestone.due_date;
+    const status = milestone.status;
+    if (!validDate(dueDate) || !status || !statusMapping || typeof statusMapping !== 'object') {
+      results.push({ milestoneKey: milestone.milestone_key, status: 'unavailable', reason: 'Missing status or due date.' });
+      continue;
+    }
+    const normalizedStatus = statusMapping[status];
+    if (normalizedStatus === 'done') {
+      results.push({ milestoneKey: milestone.milestone_key, status: 'complete', reason: 'Status is mapped as done.' });
+      continue;
+    }
+    const reportEnd = new Date(`${reportEndLocalDate}T00:00:00Z`);
+    const due = new Date(`${dueDate}T00:00:00Z`);
+    if (Number.isNaN(reportEnd.getTime()) || Number.isNaN(due.getTime())) {
+      results.push({ milestoneKey: milestone.milestone_key, status: 'unavailable', reason: 'Due date is invalid.' });
+      continue;
+    }
+    results.push({
+      milestoneKey: milestone.milestone_key,
+      status: due < reportEnd ? 'overdue' : 'on_track',
+      reason: due < reportEnd ? 'Due date is before the report end.' : 'Milestone remains active.',
+    });
+  }
+  return results;
+}
+
+function calculateGitActivity(commits, allowlist, periodStartUtc, periodEndUtc) {
+  if (!Array.isArray(commits) || !Array.isArray(allowlist)) return { count: 0, status: 'unavailable', warnings: ['Git activity is unavailable.'] };
+  const startMs = Date.parse(periodStartUtc);
+  const endMs = Date.parse(periodEndUtc);
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) {
+    return { count: 0, status: 'unavailable', warnings: ['Reporting window is invalid.'] };
+  }
+  const repoSet = new Set(allowlist.map((repo) => String(repo).trim()).filter(Boolean));
+  const seen = new Set();
+  for (const commit of commits) {
+    if (!commit || !commit.commit_sha || !commit.repository || !commit.committed_at_utc) continue;
+    if (!repoSet.has(commit.repository)) continue;
+    const committedAtMs = Date.parse(commit.committed_at_utc);
+    if (!Number.isFinite(committedAtMs)) continue;
+    if (committedAtMs >= startMs && committedAtMs <= endMs) {
+      seen.add(commit.commit_sha);
+    }
+  }
+  return { count: seen.size, status: seen.size ? 'available' : 'available', warnings: [] };
+}
+
 function sourceRetentionDeadline(receivedAt) {
   return new Date(receivedAt.getTime() + 7 * DAY_MS - SOURCE_RETENTION_SAFETY_MS);
 }
@@ -1141,6 +1296,11 @@ module.exports = {
   parseCsv,
   reportingPeriodEnd,
   reportingPeriodBounds,
+  calculateBusinessDayAge,
+  calculateInProgressAge,
+  calculateSprintProgress,
+  calculateMilestoneHealth,
+  calculateGitActivity,
   sourceRetentionDeadline,
   validateSourceFreshnessAndCoverage,
   findCurrentActiveSprintStart,

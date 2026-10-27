@@ -16,6 +16,11 @@ const {
   discardUploadData,
   validateCsvRows,
   validateUpdate,
+  calculateBusinessDayAge,
+  calculateInProgressAge,
+  calculateSprintProgress,
+  calculateMilestoneHealth,
+  calculateGitActivity,
 } = require('../src/server');
 
 test('reporting period stays open through the Monday 8:30 a.m. Eastern PM deadline', () => {
@@ -378,6 +383,48 @@ test('Jira sprint-scope accepts the specified interval contract, including added
     scopeRow({ added_at_utc: '2026-10-05T12:00:00Z' }),
   ]), null);
   assert.equal(scopeValidate([]), null);
+});
+
+test('metric helpers compute business-day age, in-progress age, sprint progress, milestone health, and git activity', () => {
+  assert.equal(calculateBusinessDayAge('2026-10-21', '2026-10-27'), 4);
+  assert.equal(calculateInProgressAge('2026-10-15T12:00:00Z', '2026-10-26T12:00:00Z'), 11);
+  assert.deepEqual(calculateSprintProgress([
+    {
+      issue_key: 'USF-1',
+      added_at_utc: '2026-10-01T12:00:00Z',
+      removed_at_utc: '',
+      story_points_at_sprint_start: '3',
+      story_points_current: '5',
+      completed_at_utc: '2026-10-20T12:00:00Z',
+    },
+    {
+      issue_key: 'USF-2',
+      added_at_utc: '2026-10-20T12:00:00Z',
+      removed_at_utc: '',
+      story_points_at_sprint_start: '2',
+      story_points_current: '2',
+      completed_at_utc: '',
+    },
+  ], '2026-10-01T12:00:00Z', '2026-10-26T12:00:00Z'), {
+    committedPoints: 3,
+    completedPoints: 5,
+    remainingPoints: 2,
+    status: 'available',
+    warnings: [],
+  });
+  assert.deepEqual(calculateMilestoneHealth([
+    { milestone_key: 'M-1', due_date: '2026-10-20', status: 'Done' },
+    { milestone_key: 'M-2', due_date: '2026-10-30', status: 'In Progress' },
+  ], '2026-10-26', { 'Done': 'done', 'In Progress': 'in_progress' }), [
+    { milestoneKey: 'M-1', status: 'complete', reason: 'Status is mapped as done.' },
+    { milestoneKey: 'M-2', status: 'on_track', reason: 'Milestone remains active.' },
+  ]);
+  assert.deepEqual(calculateGitActivity([
+    { repository: 'repo-a', commit_sha: 'abc123', committed_at_utc: '2026-10-26T10:00:00Z' },
+    { repository: 'repo-b', commit_sha: 'def456', committed_at_utc: '2026-10-26T10:00:00Z' },
+    { repository: 'repo-a', commit_sha: 'abc123', committed_at_utc: '2026-10-26T10:00:00Z' },
+    { repository: 'repo-a', commit_sha: 'ghi789', committed_at_utc: '2026-10-24T10:00:00Z' },
+  ], ['repo-a'], '2026-10-26T09:00:00Z', '2026-10-26T13:00:00Z'), { count: 1, status: 'available', warnings: [] });
 });
 
 test('Jira sprint-scope rejects the retired event-style columns', () => {
