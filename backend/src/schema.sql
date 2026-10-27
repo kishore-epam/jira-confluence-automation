@@ -83,14 +83,29 @@ CREATE TABLE IF NOT EXISTS report_runs (
     period_start TIMESTAMPTZ NOT NULL,
     period_end TIMESTAMPTZ NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'succeeded', 'partial', 'failed')),
-    scheduled_at TIMESTAMPTZ,
-    started_at TIMESTAMPTZ,
+    scheduled_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     completed_at TIMESTAMPTZ,
     failure_code TEXT,
     failure_summary TEXT,
+    project_update_id BIGINT REFERENCES project_updates(project_update_id),
+    settings_version_id BIGINT REFERENCES reporting_settings(settings_version_id),
+    trigger_type TEXT NOT NULL CHECK (trigger_type IN ('scheduled', 'manual')),
+    retry_of_report_run_id UUID REFERENCES report_runs(report_run_id),
+    worker_version TEXT,
     previous_success_preserved BOOLEAN NOT NULL DEFAULT TRUE,
+    lease_expires_at TIMESTAMPTZ,
+    last_heartbeat_at TIMESTAMPTZ,
     artifact_path TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS report_run_inputs (
+    report_run_id UUID NOT NULL REFERENCES report_runs(report_run_id),
+    source_input_id UUID NOT NULL,
+    input_role TEXT NOT NULL CHECK (input_role IN ('source', 'artifact')),
+    consumed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (report_run_id, source_input_id)
 );
 
 CREATE TABLE IF NOT EXISTS report_reviews (

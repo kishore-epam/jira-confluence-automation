@@ -21,6 +21,10 @@ const {
   calculateSprintProgress,
   calculateMilestoneHealth,
   calculateGitActivity,
+  requireWorkerToken,
+  claimReportRun,
+  heartbeatReportRun,
+  completeReportRun,
 } = require('../src/server');
 
 test('reporting period stays open through the Monday 8:30 a.m. Eastern PM deadline', () => {
@@ -464,6 +468,167 @@ test('Jira issue-links follow the specified columns and require every value', ()
   assert.match(validateCsvRows('jira', 'issue-links', ['link_id', 'source_issue_key', 'target_issue_key', 'link_type'], [
     { link_id: '1', source_issue_key: 'USF-1', target_issue_key: 'USF-2', link_type: 'blocks' },
   ]), /columns do not match/i);
+});
+
+test('worker token gate rejects missing or invalid bearer tokens', () => {
+  process.env.USF_PLAN_WORKER_TOKEN = 'secret-token';
+  const next = () => {};
+  const res = {
+    statusCode: null,
+    payload: null,
+    status(code) {
+      this.statusCode = code;
+      return this;
+    },
+    json(payload) {
+      this.payload = payload;
+      return this;
+    },
+  };
+  requireWorkerToken({ headers: {} }, res, next);
+  assert.equal(res.statusCode, 401);
+  requireWorkerToken({ headers: { authorization: 'Bearer wrong' } }, res, next);
+  assert.equal(res.statusCode, 401);
+
+  const okRes = { statusCode: null, payload: null, status(code) { this.statusCode = code; return this; }, json(payload) { this.payload = payload; return this; } };
+  requireWorkerToken({ headers: { authorization: 'Bearer secret-token' } }, okRes, next);
+  assert.equal(okRes.statusCode, null);
+});
+
+test('report-run lifecycle claims, heartbeats, and completes a running job', async () => {
+  const fakeDb = {
+    async query(sql, params = []) {
+      const normalized = String(sql).replace(/\s+/g, ' ').trim();
+      if (normalized.includes('SELECT project_id FROM projects')) {
+        return { rowCount: 1, rows: [{ project_id: 11 }] };
+      }
+      if (normalized.includes('SELECT report_run_id FROM report_runs WHERE project_id = $1 AND status = \'running\'')) {
+        return { rowCount: 0, rows: [] };
+      }
+      if (normalized.includes('SELECT settings_version_id FROM reporting_settings')) {
+        return { rowCount: 1, rows: [{ settings_version_id: 3 }] };
+      }
+      if (normalized.includes('SELECT project_update_id FROM project_updates')) {
+        return { rowCount: 1, rows: [{ project_update_id: 9 }] };
+      }
+      if (normalized.includes('INSERT INTO report_runs')) {
+        return {
+          rowCount: 1,
+          rows: [{
+            report_run_id: params[0],
+            project_id: params[1],
+            period_start: params[2],
+            period_end: params[3],
+            status: 'running',
+            scheduled_at: params[4],
+            started_at: params[5],
+            lease_expires_at: params[6],
+            last_heartbeat_at: params[7],
+            project_update_id: params[8],
+            settings_version_id: params[9],
+            trigger_type: params[10],
+            retry_of_report_run_id: params[11],
+            worker_version: params[12],
+          }],
+        };
+      }
+      if (normalized.includes('UPDATE report_runs SET last_heartbeat_at = $2, lease_expires_at = $3')) {
+        return {
+          rowCount: 1,
+          rows: [{
+            report_run_id: params[0],
+            status: 'running',
+            last_heartbeat_at: params[1],
+            lease_expires_at: params[2],
+          }],
+        };
+      }
+      if (normalized.includes('UPDATE report_runs SET status = $2')) {
+        return {
+          rowCount: 1,
+          rows: [{
+            report_run_id: params[0],
+            status: params[1],
+            completed_at: params[2],
+            failure_summary: params[4],
+            artifact_path: params[5],
+          }],
+        };
+      }
+      if (normalized.includes('SELECT report_run_id, status, lease_expires_at')) {
+        return {
+          rowCount: 1,
+          rows: [{
+            report_run_id: params[0],
+            status: 'running',
+            lease_expires_at: '2026-11-02T14:05:00.000Z',
+            artifact_path: null,
+            completed_at: null,
+          }],
+        };
+      }
+      return { rowCount: 0, rows: [] };
+    },
+  };
+
+  const run = await claimReportRun({
+    db: fakeDb,
+    periodEndLocalDate: '2026-11-02',
+    sourceInputIds: ['source-1', 'source-2'],
+  });
+  assert.equal(run.status, 'running');
+  assert.equal(run.projectId, 11);
+
+  const heartbeat = await heartbeatReportRun({ db: fakeDb, runId: run.reportRunId, now: new Date('2026-11-02T14:00:00Z') });
+  assert.equal(heartbeat.status, 'running');
+
+  const complete = await completeReportRun({
+    db: fakeDb,
+    runId: run.reportRunId,
+    finalStatus: 'succeeded',
+    artifactPath: '2026-11-02-report.pptx',
+    now: new Date('2026-11-02T14:01:00Z'),
+  });
+  assert.equal(complete.status, 'succeeded');
+  assert.match(complete.artifactPath, /2026-11-02-report\.pptx/);
+});
+
+test('report-run lifecycle rejects duplicate claims and expired or invalid transitions', async () => {
+  const activeDb = {
+    async query(sql) {
+      const normalized = String(sql).replace(/\s+/g, ' ').trim();
+      if (normalized.includes('SELECT project_id FROM projects')) {
+        return { rowCount: 1, rows: [{ project_id: 11 }] };
+      }
+      if (normalized.includes('SELECT report_run_id FROM report_runs WHERE project_id = $1 AND status = \'running\'')) {
+        return { rowCount: 1, rows: [{ report_run_id: 'run-123' }] };
+      }
+      return { rowCount: 0, rows: [] };
+    },
+  };
+  await assert.rejects(() => claimReportRun({ db: activeDb, periodEndLocalDate: '2026-11-02' }), /Another active report run/i);
+
+  const expiredDb = {
+    async query(sql, params = []) {
+      const normalized = String(sql).replace(/\s+/g, ' ').trim();
+      if (normalized.includes('SELECT report_run_id, status, lease_expires_at')) {
+        return {
+          rowCount: 1,
+          rows: [{ report_run_id: params[0], status: 'running', lease_expires_at: '2026-11-02T15:00:00.000Z' }],
+        };
+      }
+      if (normalized.includes('UPDATE report_runs SET last_heartbeat_at = $2, lease_expires_at = $3')) {
+        return { rowCount: 1, rows: [{ report_run_id: params[0], status: 'running', lease_expires_at: params[2], last_heartbeat_at: params[1] }] };
+      }
+      if (normalized.includes('UPDATE report_runs SET status = $2')) {
+        return { rowCount: 1, rows: [{ report_run_id: params[0], status: params[1], completed_at: params[2], failure_summary: params[4], artifact_path: params[5] }] };
+      }
+      return { rowCount: 0, rows: [] };
+    },
+  };
+  await assert.rejects(() => heartbeatReportRun({ db: expiredDb, runId: 'run-1', now: new Date('2026-11-02T16:00:00Z') }), /expired/i);
+  await assert.rejects(() => completeReportRun({ db: expiredDb, runId: 'run-1', finalStatus: 'partial', now: new Date('2026-11-02T16:00:00Z') }), /expired/i);
+  await assert.rejects(() => completeReportRun({ db: expiredDb, runId: 'run-1', finalStatus: 'invalid', now: new Date('2026-11-02T14:00:00Z') }), /only complete as/i);
 });
 
 const milestoneHeaders = ['milestone_key', 'name', 'due_date', 'status', 'updated_at_utc', 'client_shareable'];

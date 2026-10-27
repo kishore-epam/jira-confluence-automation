@@ -19,6 +19,8 @@ const SOURCE_RETENTION_SAFETY_MS = SOURCE_CLEANUP_INTERVAL_MS;
 const ROOT = path.resolve(__dirname, '..', '..');
 const INPUT_DIR = path.join(ROOT, 'data', 'inputs');
 const REPORT_DIR = path.join(ROOT, 'data', 'reports');
+const REPORT_RUN_HEARTBEAT_MS = 60 * 1000;
+const REPORT_RUN_LEASE_MS = 5 * 60 * 1000;
 const schemaPath = path.join(__dirname, 'schema.sql');
 
 const pool = new Pool({
@@ -45,6 +47,19 @@ function safeEqual(left, right) {
   const leftBuffer = Buffer.from(left || '');
   const rightBuffer = Buffer.from(right || '');
   return leftBuffer.length === rightBuffer.length && crypto.timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function ensureReportArtifactPath(candidate) {
+  if (!candidate) return null;
+  const absolute = path.resolve(REPORT_DIR, candidate);
+  const reportRoot = path.resolve(REPORT_DIR);
+  if (absolute !== reportRoot && !absolute.startsWith(`${reportRoot}${path.sep}`)) {
+    throw Object.assign(new Error('Artifact path must stay within the local report directory.'), {
+      statusCode: 400,
+      code: 'INVALID_ARTIFACT_PATH',
+    });
+  }
+  return absolute;
 }
 
 function errorResponse(res, status, code, message, details = []) {
@@ -438,6 +453,232 @@ async function purgeExpiredSourceFiles(db = pool, inputDirectory = INPUT_DIR, no
 function discardUploadData(sourceType, file, parsed) {
   if (Buffer.isBuffer(file?.buffer)) file.buffer.fill(0);
   if (sourceType === 'capacity' && Array.isArray(parsed?.records)) parsed.records.length = 0;
+}
+
+async function claimReportRun({
+  db = pool,
+  projectKey = PROJECT_KEY,
+  periodEndLocalDate = reportingPeriodEnd(),
+  sourceInputIds = [],
+  settingsVersionId = null,
+  projectUpdateId = null,
+  triggerType = 'scheduled',
+  retryOfReportRunId = null,
+  now = new Date(),
+  workerVersion = 'local-worker',
+} = {}) {
+  const bounds = reportingPeriodBounds(periodEndLocalDate);
+  const project = await db.query(
+    `SELECT project_id FROM projects WHERE project_key = $1`,
+    [projectKey],
+  );
+  if (!project.rowCount) {
+    throw Object.assign(new Error('Project not found.'), { statusCode: 404, code: 'PROJECT_NOT_FOUND' });
+  }
+  const projectId = project.rows[0].project_id;
+  const activeClaim = await db.query(
+    `SELECT report_run_id FROM report_runs
+     WHERE project_id = $1 AND status = 'running'
+       AND (lease_expires_at IS NULL OR lease_expires_at > $2)
+     LIMIT 1`,
+    [projectId, now.toISOString()],
+  );
+  if (activeClaim.rowCount) {
+    throw Object.assign(new Error('Another active report run already exists for this project.'), {
+      statusCode: 409,
+      code: 'RUN_ALREADY_ACTIVE',
+    });
+  }
+
+  let currentSettingsVersionId = settingsVersionId;
+  if (currentSettingsVersionId == null) {
+    const settings = await db.query(
+      `SELECT settings_version_id
+       FROM reporting_settings
+       WHERE project_id = $1
+       ORDER BY settings_version_id DESC LIMIT 1`,
+      [projectId],
+    );
+    if (!settings.rowCount) {
+      throw Object.assign(new Error('A configured settings version is required before claiming a run.'), {
+        statusCode: 503,
+        code: 'SETTINGS_UNAVAILABLE',
+      });
+    }
+    currentSettingsVersionId = settings.rows[0].settings_version_id;
+  }
+
+  let currentProjectUpdateId = projectUpdateId;
+  if (currentProjectUpdateId == null) {
+    const update = await db.query(
+      `SELECT project_update_id
+       FROM project_updates
+       WHERE project_id = $1 AND period_end = $2::date
+       ORDER BY revision DESC LIMIT 1`,
+      [projectId, periodEndLocalDate],
+    );
+    if (update.rowCount) currentProjectUpdateId = update.rows[0].project_update_id;
+  }
+
+  const runId = crypto.randomUUID();
+  const leaseExpiresAt = new Date(now.getTime() + REPORT_RUN_LEASE_MS);
+  const created = await db.query(
+    `INSERT INTO report_runs (
+      report_run_id, project_id, period_start, period_end, status,
+      scheduled_at, started_at, lease_expires_at, last_heartbeat_at,
+      project_update_id, settings_version_id, trigger_type,
+      retry_of_report_run_id, worker_version, previous_success_preserved
+    ) VALUES (
+      $1, $2, $3, $4, 'running', $5, $6, $7, $8, $9, $10, $11, $12, $13, TRUE
+    ) RETURNING report_run_id, project_id, period_start, period_end, status,
+      scheduled_at, started_at, lease_expires_at, last_heartbeat_at,
+      project_update_id, settings_version_id, trigger_type, retry_of_report_run_id,
+      worker_version`,
+    [
+      runId,
+      projectId,
+      bounds.periodStart.toISOString(),
+      bounds.periodEnd.toISOString(),
+      now.toISOString(),
+      now.toISOString(),
+      leaseExpiresAt.toISOString(),
+      now.toISOString(),
+      currentProjectUpdateId,
+      currentSettingsVersionId,
+      triggerType,
+      retryOfReportRunId,
+      workerVersion,
+    ],
+  );
+  const claimed = created.rows[0];
+  if (Array.isArray(sourceInputIds) && sourceInputIds.length > 0) {
+    for (const sourceInputId of sourceInputIds) {
+      try {
+        await db.query(
+          `INSERT INTO report_run_inputs (report_run_id, source_input_id, input_role, consumed_at)
+           VALUES ($1, $2, 'source', $3)
+           ON CONFLICT (report_run_id, source_input_id) DO NOTHING`,
+          [runId, sourceInputId, now.toISOString()],
+        );
+      } catch (error) {
+        if (error.code !== '42P01') throw error;
+      }
+    }
+  }
+  return {
+    reportRunId: claimed.report_run_id,
+    projectId: claimed.project_id,
+    status: claimed.status,
+    periodStart: claimed.period_start,
+    periodEnd: claimed.period_end,
+    scheduledAt: claimed.scheduled_at,
+    startedAt: claimed.started_at,
+    leaseExpiresAt: claimed.lease_expires_at,
+    lastHeartbeatAt: claimed.last_heartbeat_at,
+    settingsVersionId: claimed.settings_version_id,
+    projectUpdateId: claimed.project_update_id,
+    triggerType: claimed.trigger_type,
+    retryOfReportRunId: claimed.retry_of_report_run_id,
+  };
+}
+
+async function heartbeatReportRun({
+  db = pool,
+  runId,
+  now = new Date(),
+  leaseMs = REPORT_RUN_LEASE_MS,
+} = {}) {
+  const active = await db.query(
+    `SELECT report_run_id, status, lease_expires_at
+     FROM report_runs WHERE report_run_id = $1`,
+    [runId],
+  );
+  if (!active.rowCount) {
+    throw Object.assign(new Error('Report run not found.'), { statusCode: 404, code: 'REPORT_RUN_NOT_FOUND' });
+  }
+  const row = active.rows[0];
+  if (row.status !== 'running') {
+    throw Object.assign(new Error('Only an active claim can be heartbeated.'), { statusCode: 409, code: 'RUN_NOT_RUNNING' });
+  }
+  if (row.lease_expires_at && new Date(row.lease_expires_at).getTime() <= now.getTime()) {
+    throw Object.assign(new Error('The worker claim has expired and must be retried.'), { statusCode: 409, code: 'CLAIM_EXPIRED' });
+  }
+  const nextLease = new Date(now.getTime() + leaseMs);
+  const updated = await db.query(
+    `UPDATE report_runs
+     SET last_heartbeat_at = $2, lease_expires_at = $3
+     WHERE report_run_id = $1
+     RETURNING report_run_id, status, last_heartbeat_at, lease_expires_at`,
+    [runId, now.toISOString(), nextLease.toISOString()],
+  );
+  return {
+    reportRunId: updated.rows[0].report_run_id,
+    status: updated.rows[0].status,
+    lastHeartbeatAt: updated.rows[0].last_heartbeat_at,
+    leaseExpiresAt: updated.rows[0].lease_expires_at,
+  };
+}
+
+async function completeReportRun({
+  db = pool,
+  runId,
+  finalStatus,
+  summary = null,
+  artifactPath = null,
+  now = new Date(),
+} = {}) {
+  const validFinalStates = new Set(['succeeded', 'partial', 'failed']);
+  if (!validFinalStates.has(finalStatus)) {
+    throw Object.assign(new Error('A report run can only complete as succeeded, partial, or failed.'), {
+      statusCode: 422,
+      code: 'INVALID_FINAL_STATUS',
+    });
+  }
+  const active = await db.query(
+    `SELECT report_run_id, status, lease_expires_at, artifact_path, completed_at
+     FROM report_runs WHERE report_run_id = $1`,
+    [runId],
+  );
+  if (!active.rowCount) {
+    throw Object.assign(new Error('Report run not found.'), { statusCode: 404, code: 'REPORT_RUN_NOT_FOUND' });
+  }
+  const row = active.rows[0];
+  if (row.status !== 'running') {
+    return {
+      reportRunId: row.report_run_id,
+      status: row.status,
+      completedAt: row.completed_at || null,
+      artifactPath: row.artifact_path,
+      idempotent: true,
+    };
+  }
+  if (row.lease_expires_at && new Date(row.lease_expires_at).getTime() <= now.getTime()) {
+    throw Object.assign(new Error('The worker claim expired before completion was accepted.'), {
+      statusCode: 409,
+      code: 'CLAIM_EXPIRED',
+    });
+  }
+  const safeArtifact = ensureReportArtifactPath(artifactPath);
+  const updated = await db.query(
+    `UPDATE report_runs
+     SET status = $2,
+         completed_at = $3,
+         failure_code = $4,
+         failure_summary = $5,
+         artifact_path = $6,
+         last_heartbeat_at = $3,
+         lease_expires_at = $3
+     WHERE report_run_id = $1
+     RETURNING report_run_id, status, completed_at, failure_summary, artifact_path`,
+    [runId, finalStatus, now.toISOString(), finalStatus === 'failed' ? 'REPORT_FAILED' : null, summary, safeArtifact],
+  );
+  return {
+    reportRunId: updated.rows[0].report_run_id,
+    status: updated.rows[0].status,
+    completedAt: updated.rows[0].completed_at,
+    artifactPath: updated.rows[0].artifact_path,
+    idempotent: false,
+  };
 }
 
 function clientSafeSummary(error) {
@@ -1243,14 +1484,63 @@ function requireWorkerToken(req, res, next) {
   next();
 }
 
-app.post('/internal/v1/report-runs/claim', requireWorkerToken, (_req, res) => {
-  res.status(501).json({ error: { code: 'WORKER_UNAVAILABLE', message: 'Scheduled report execution is not configured.' } });
+app.post('/internal/v1/report-runs/claim', requireWorkerToken, async (req, res, next) => {
+  try {
+    const payload = req.body || {};
+    const run = await claimReportRun({
+      db: pool,
+      projectKey: payload.projectKey || PROJECT_KEY,
+      periodEndLocalDate: payload.periodEndLocalDate || reportingPeriodEnd(),
+      sourceInputIds: Array.isArray(payload.sourceInputIds) ? payload.sourceInputIds : [],
+      settingsVersionId: payload.settingsVersionId ?? null,
+      projectUpdateId: payload.projectUpdateId ?? null,
+      triggerType: payload.triggerType || 'scheduled',
+      retryOfReportRunId: payload.retryOfReportRunId || null,
+      workerVersion: payload.workerVersion || 'local-worker',
+    });
+    res.status(201).json(run);
+  } catch (error) {
+    if (error.statusCode) {
+      return errorResponse(res, error.statusCode, error.code || 'WORKER_ERROR', error.message);
+    }
+    next(error);
+  }
 });
-app.post('/internal/v1/report-runs/:runId/heartbeat', requireWorkerToken, (_req, res) => {
-  res.status(501).json({ error: { code: 'WORKER_UNAVAILABLE', message: 'Scheduled report execution is not configured.' } });
+
+app.post('/internal/v1/report-runs/:runId/heartbeat', requireWorkerToken, async (req, res, next) => {
+  try {
+    const run = await heartbeatReportRun({
+      db: pool,
+      runId: req.params.runId,
+      now: new Date(),
+    });
+    res.status(200).json(run);
+  } catch (error) {
+    if (error.statusCode) {
+      return errorResponse(res, error.statusCode, error.code || 'WORKER_ERROR', error.message);
+    }
+    next(error);
+  }
 });
-app.post('/internal/v1/report-runs/:runId/complete', requireWorkerToken, (_req, res) => {
-  res.status(501).json({ error: { code: 'WORKER_UNAVAILABLE', message: 'Scheduled report execution is not configured.' } });
+
+app.post('/internal/v1/report-runs/:runId/complete', requireWorkerToken, async (req, res, next) => {
+  try {
+    const payload = req.body || {};
+    const run = await completeReportRun({
+      db: pool,
+      runId: req.params.runId,
+      finalStatus: payload.finalStatus,
+      summary: payload.summary ?? null,
+      artifactPath: payload.artifactPath ?? null,
+      now: new Date(),
+    });
+    res.status(200).json(run);
+  } catch (error) {
+    if (error.statusCode) {
+      return errorResponse(res, error.statusCode, error.code || 'WORKER_ERROR', error.message);
+    }
+    next(error);
+  }
 });
 
 app.use((req, res) => errorResponse(res, 404, 'NOT_FOUND', 'The requested route was not found.'));
@@ -1301,6 +1591,10 @@ module.exports = {
   calculateSprintProgress,
   calculateMilestoneHealth,
   calculateGitActivity,
+  requireWorkerToken,
+  claimReportRun,
+  heartbeatReportRun,
+  completeReportRun,
   sourceRetentionDeadline,
   validateSourceFreshnessAndCoverage,
   findCurrentActiveSprintStart,
