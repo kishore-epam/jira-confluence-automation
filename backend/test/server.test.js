@@ -109,6 +109,75 @@ test('Jira issue rejects a status that is not configured in the mapping', () => 
   ), /unknown or mismatched status\/category mapping/i);
 });
 
+const jiraWorklogHeaders = ['worklog_id', 'issue_key', 'started_at_utc', 'hours'];
+
+function jiraWorklog(worklogId, hours, startedAt = '2026-10-26T12:00:00Z') {
+  return {
+    worklog_id: worklogId,
+    issue_key: 'USF-1',
+    started_at_utc: startedAt,
+    hours,
+  };
+}
+
+test('Jira worklog contract accepts a valid non-negative decimal hours value', () => {
+  assert.equal(validateCsvRows(
+    'jira',
+    'worklogs',
+    jiraWorklogHeaders,
+    [jiraWorklog('1', '1.25')],
+  ), null);
+});
+
+test('Jira worklog contract accepts zero hours', () => {
+  assert.equal(validateCsvRows(
+    'jira',
+    'worklogs',
+    jiraWorklogHeaders,
+    [jiraWorklog('1', '0')],
+  ), null);
+});
+
+test('Jira worklog contract rejects negative and malformed hours values', () => {
+  for (const hours of ['-0.25', 'not-a-number']) {
+    assert.match(validateCsvRows(
+      'jira',
+      'worklogs',
+      jiraWorklogHeaders,
+      [jiraWorklog('1', hours)],
+    ), /invalid hours\/timestamps/i);
+  }
+});
+
+test('Jira worklog contract rejects duplicate worklog IDs', () => {
+  assert.match(validateCsvRows(
+    'jira',
+    'worklogs',
+    jiraWorklogHeaders,
+    [jiraWorklog('1', '1'), jiraWorklog('1', '2')],
+  ), /duplicate IDs/i);
+});
+
+test('Jira worklog contract requires a valid UTC start timestamp', () => {
+  for (const startedAt of ['', '2026-10-26T12:00:00+02:00', 'not-a-timestamp']) {
+    assert.match(validateCsvRows(
+      'jira',
+      'worklogs',
+      jiraWorklogHeaders,
+      [jiraWorklog('1', '1', startedAt)],
+    ), /invalid hours\/timestamps/i);
+  }
+});
+
+test('Jira worklog contract requires the specified hours column', () => {
+  assert.match(validateCsvRows(
+    'jira',
+    'worklogs',
+    ['worklog_id', 'issue_key', 'started_at_utc', 'time_spent_seconds'],
+    [jiraWorklog('1', '1')],
+  ), /columns do not match/i);
+});
+
 test('capacity import returns an aggregate without retaining the person key', () => {
   const result = validateCsvRows('capacity', 'allocations',
     ['person_key', 'week_start', 'planned_hours'],

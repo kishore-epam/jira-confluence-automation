@@ -321,7 +321,7 @@ const CSV_CONTRACTS = {
     issues: ['issue_key', 'title', 'status', 'status_category', 'updated_at_utc', 'in_progress_since_utc', 'story_points', 'issue_type', 'client_shareable'],
     sprints: ['sprint_id', 'name', 'state', 'start_at_utc', 'end_at_utc'],
     'sprint-scope': ['sprint_id', 'issue_key', 'event_type', 'event_at_utc', 'story_points_at_event'],
-    worklogs: ['worklog_id', 'issue_key', 'started_at_utc', 'time_spent_seconds'],
+    worklogs: ['worklog_id', 'issue_key', 'started_at_utc', 'hours'],
     'issue-links': ['link_id', 'source_issue_key', 'target_issue_key', 'link_type'],
     milestones: ['milestone_id', 'name', 'status', 'due_date_local', 'client_shareable'],
   },
@@ -395,9 +395,12 @@ function validateCsvRows(sourceType, dataset, headers, rows, statusMapping = {})
     return 'Sprint scope contains invalid events, estimates, or timestamps.';
   }
   if (sourceType === 'jira' && dataset === 'worklogs'
-    && (!isUnique('worklog_id') || !validTimestamps(['started_at_utc'])
-      || rows.some((row) => !Number.isFinite(Number(row.time_spent_seconds)) || Number(row.time_spent_seconds) <= 0))) {
-    return 'Jira worklogs contain duplicate IDs or invalid time values.';
+    && (!isUnique('worklog_id')
+      || rows.some((row) => !validUtcTimestamp(row.started_at_utc)
+        || !/^\d+(?:\.\d+)?$/.test(row.hours)
+        || !Number.isFinite(Number(row.hours))
+        || Number(row.hours) < 0))) {
+    return 'Jira worklogs contain duplicate IDs or invalid hours/timestamps.';
   }
   if (sourceType === 'jira' && dataset === 'issue-links' && !isUnique('link_id')) {
     return 'Jira issue links contain duplicate identifiers.';
