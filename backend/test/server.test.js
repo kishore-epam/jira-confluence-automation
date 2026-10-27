@@ -889,3 +889,109 @@ test('capacity import returns an aggregate without retaining the person key', ()
   assert.deepEqual(result, { capacityTotal: 7.5, weekStart: '2026-10-26' });
   assert.equal(JSON.stringify(result).includes('person-'), false);
 });
+
+test('T-028 complete and partial end-to-end report flows keep the six-slide deck and preserve prior artifacts', async () => {
+  const snapshot = {
+    projectKey: 'USF-PLAN',
+    period: { start: '2026-10-26', end: '2026-11-02' },
+    ragStatus: 'amber',
+    ragRationale: 'Scope is stable, but two blocker decisions still need sponsor approval.',
+    accomplishments: ['Completed sprint validation', 'Confirmed dependency resolution'],
+    topAttentionItems: ['Resolve sponsor decision for the scope extension'],
+    sprint: {
+      name: 'Sprint 13',
+      committedPoints: 30,
+      completedPoints: 18,
+      remainingPoints: 12,
+      additions: ['Scope extension approved by the PM'],
+      removals: ['Deferred backlog item'],
+      caveats: ['Forecast values remain unavailable in this prototype'],
+    },
+    milestones: [{ milestoneKey: 'M-1', status: 'at_risk', summary: 'Needs sponsor alignment' }],
+    issues: [{ issueKey: 'USF-100', status: 'in_progress', age: '4 business days', summary: 'Waiting on client decision' }],
+    blockers: [{ issueKey: 'USF-177', summary: 'Client approval pending' }],
+    decisions: [{ issueKey: 'Decision', summary: 'Sponsor review needed for scope change' }],
+    capacity: { plannedHours: 42, actualHours: 29 },
+    gitActivity: { count: 5 },
+    sourceWarnings: ['Jira issues export is stale by 2 calendar days.'],
+    confluenceRefs: [{ title: 'Client roadmap', summary: 'Approved project reference' }],
+    nextWeekPriorities: ['Confirm scope decision and close remaining blocker'],
+  };
+
+  const slides = buildReportDeckSlides(snapshot);
+  assert.equal(slides.length, 6);
+  assert.deepEqual(slides.map((slide) => slide.title), [
+    'Executive summary',
+    'Sprint progress and scope',
+    'Milestones and forecast availability',
+    'Issues, blockers, dependencies, and decisions',
+    'Aggregate capacity and Git activity',
+    'Next-week priorities and data quality',
+  ]);
+  assert.match(slides[0].body.join(' '), /RAG status: AMBER/i);
+  assert.match(slides[5].body.join(' '), /Source quality: .*stale/i);
+
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'usf-plan-e2e-'));
+  const successPath = path.join(tempDir, 'USF-PLAN-weekly-status-2026-11-02.pptx');
+  const report = generatePowerPointReport(snapshot, successPath);
+  assert.equal(report, successPath);
+  assert.equal(nodeFs.existsSync(successPath), true);
+  assert.ok(nodeFs.statSync(successPath).size > 1024);
+
+  const previousArtifact = path.join(tempDir, 'previous-success.pptx');
+  await fs.writeFile(previousArtifact, 'prior-success-artifact');
+  const fakeDb = {
+    async query(sql, params = []) {
+      const normalized = String(sql).replace(/\s+/g, ' ').trim();
+      if (normalized.includes('SELECT report_run_id, status, lease_expires_at, artifact_path, completed_at, started_at')) {
+        return {
+          rowCount: 1,
+          rows: [{
+            report_run_id: 'run-fail',
+            status: 'running',
+            lease_expires_at: '2999-01-01T00:00:00.000Z',
+            artifact_path: null,
+            completed_at: null,
+            started_at: '2026-11-02T14:00:00.000Z',
+          }],
+        };
+      }
+      if (normalized.includes('SELECT project_id, period_end FROM report_runs WHERE report_run_id = $1')) {
+        return {
+          rowCount: 1,
+          rows: [{ project_id: 11, period_end: '2026-11-02T14:00:00.000Z' }],
+        };
+      }
+      if (normalized.includes('SELECT report_run_id FROM report_runs WHERE project_id = $1 AND report_run_id <> $2')) {
+        return { rowCount: 0, rows: [] };
+      }
+      if (normalized.includes('UPDATE report_runs SET status = $2')) {
+        return {
+          rowCount: 1,
+          rows: [{
+            report_run_id: params[0],
+            status: params[1],
+            completed_at: params[2],
+            failure_summary: params[4],
+            artifact_path: params[5],
+          }],
+        };
+      }
+      return { rowCount: 0, rows: [] };
+    },
+  };
+
+  const failedRun = await completeReportRun({
+    db: fakeDb,
+    runId: 'run-fail',
+    finalStatus: 'failed',
+    summary: 'Missing required Jira input for this reporting period.',
+    now: new Date('2026-11-02T14:05:00Z'),
+    reportDirectory: tempDir,
+  });
+
+  assert.equal(failedRun.status, 'failed');
+  assert.equal(nodeFs.existsSync(previousArtifact), true);
+  assert.equal(nodeFs.existsSync(path.join(tempDir, 'latest.pptx')), false);
+  await fs.rm(tempDir, { recursive: true, force: true });
+});
