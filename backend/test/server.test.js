@@ -353,6 +353,105 @@ test('Jira worklog contract requires the specified hours column', () => {
   ), /columns do not match/i);
 });
 
+const scopeHeaders = ['sprint_id', 'issue_key', 'added_at_utc', 'removed_at_utc', 'story_points_at_sprint_start', 'story_points_current', 'completed_at_utc'];
+
+function scopeRow(overrides = {}) {
+  return {
+    sprint_id: '1',
+    issue_key: 'USF-1',
+    added_at_utc: '2026-10-01T12:00:00Z',
+    removed_at_utc: '',
+    story_points_at_sprint_start: '3',
+    story_points_current: '5',
+    completed_at_utc: '',
+    ...overrides,
+  };
+}
+
+const scopeValidate = (rows, headers = scopeHeaders) => validateCsvRows('jira', 'sprint-scope', headers, rows);
+
+test('Jira sprint-scope accepts the specified interval contract, including added-after-start and re-addition', () => {
+  assert.equal(scopeValidate([scopeRow()]), null);
+  assert.equal(scopeValidate([scopeRow({ story_points_at_sprint_start: '' })]), null);
+  assert.equal(scopeValidate([
+    scopeRow({ removed_at_utc: '2026-10-05T12:00:00Z' }),
+    scopeRow({ added_at_utc: '2026-10-05T12:00:00Z' }),
+  ]), null);
+  assert.equal(scopeValidate([]), null);
+});
+
+test('Jira sprint-scope rejects the retired event-style columns', () => {
+  assert.match(scopeValidate([], ['sprint_id', 'issue_key', 'event_type', 'event_at_utc', 'story_points_at_event']), /columns do not match/i);
+});
+
+test('Jira sprint-scope rejects overlapping membership intervals for the same issue and sprint', () => {
+  assert.match(scopeValidate([
+    scopeRow({ removed_at_utc: '2026-10-10T12:00:00Z' }),
+    scopeRow({ added_at_utc: '2026-10-05T12:00:00Z' }),
+  ]), /overlapping/i);
+  assert.match(scopeValidate([scopeRow(), scopeRow({ added_at_utc: '2026-10-05T12:00:00Z' })]), /overlapping/i);
+  assert.equal(scopeValidate([scopeRow(), scopeRow({ sprint_id: '2' })]), null);
+});
+
+test('Jira sprint-scope rejects missing added time, bad timestamps, negative points, and removal before addition', () => {
+  for (const override of [
+    { added_at_utc: '' },
+    { completed_at_utc: 'yesterday' },
+    { removed_at_utc: '2026-09-30T12:00:00Z' },
+    { story_points_current: '-1' },
+    { story_points_at_sprint_start: 'abc' },
+  ]) {
+    assert.match(scopeValidate([scopeRow(override)]), /invalid identifiers, estimates, or timestamps/i);
+  }
+});
+
+const linkHeaders = ['issue_key', 'linked_issue_key', 'link_type'];
+
+test('Jira issue-links follow the specified columns and require every value', () => {
+  assert.equal(validateCsvRows('jira', 'issue-links', linkHeaders, [
+    { issue_key: 'USF-1', linked_issue_key: 'USF-2', link_type: 'blocks' },
+  ]), null);
+  assert.match(validateCsvRows('jira', 'issue-links', linkHeaders, [
+    { issue_key: 'USF-1', linked_issue_key: '', link_type: 'blocks' },
+  ]), /must include issue keys and a link type/i);
+  assert.match(validateCsvRows('jira', 'issue-links', ['link_id', 'source_issue_key', 'target_issue_key', 'link_type'], [
+    { link_id: '1', source_issue_key: 'USF-1', target_issue_key: 'USF-2', link_type: 'blocks' },
+  ]), /columns do not match/i);
+});
+
+const milestoneHeaders = ['milestone_key', 'name', 'due_date', 'status', 'updated_at_utc', 'client_shareable'];
+
+function milestone(overrides = {}) {
+  return {
+    milestone_key: 'M-1',
+    name: 'Beta',
+    due_date: '2026-11-15',
+    status: 'In Progress',
+    updated_at_utc: '2026-10-26T12:00:00Z',
+    client_shareable: 'true',
+    ...overrides,
+  };
+}
+
+test('Jira milestones accept the specified contract', () => {
+  assert.equal(validateCsvRows('jira', 'milestones', milestoneHeaders, [milestone()]), null);
+});
+
+test('Jira milestones reject duplicate keys, bad dates, bad timestamps, bad sharing flags, and missing status', () => {
+  assert.match(validateCsvRows('jira', 'milestones', milestoneHeaders, [milestone(), milestone()]), /duplicate keys/i);
+  for (const override of [
+    { due_date: '2026-02-30' },
+    { updated_at_utc: '2026-10-26T12:00:00+02:00' },
+    { client_shareable: 'yes' },
+    { status: '' },
+  ]) {
+    assert.match(validateCsvRows('jira', 'milestones', milestoneHeaders, [milestone(override)]), /missing status or invalid/i);
+  }
+  assert.match(validateCsvRows('jira', 'milestones', ['milestone_id', 'name', 'status', 'due_date_local', 'client_shareable'], [
+    { milestone_id: '1', name: 'Beta', status: 'Done', due_date_local: '2026-11-15', client_shareable: 'true' },
+  ]), /columns do not match/i);
+});
+
 test('capacity import returns an aggregate without retaining the person key', () => {
   const result = validateCsvRows('capacity', 'allocations',
     ['person_key', 'week_start', 'planned_hours'],

@@ -489,10 +489,10 @@ const CSV_CONTRACTS = {
   jira: {
     issues: ['issue_key', 'title', 'status', 'status_category', 'updated_at_utc', 'in_progress_since_utc', 'story_points', 'issue_type', 'client_shareable'],
     sprints: ['sprint_id', 'name', 'state', 'start_at_utc', 'end_at_utc'],
-    'sprint-scope': ['sprint_id', 'issue_key', 'event_type', 'event_at_utc', 'story_points_at_event'],
+    'sprint-scope': ['sprint_id', 'issue_key', 'added_at_utc', 'removed_at_utc', 'story_points_at_sprint_start', 'story_points_current', 'completed_at_utc'],
     worklogs: ['worklog_id', 'issue_key', 'started_at_utc', 'hours'],
-    'issue-links': ['link_id', 'source_issue_key', 'target_issue_key', 'link_type'],
-    milestones: ['milestone_id', 'name', 'status', 'due_date_local', 'client_shareable'],
+    'issue-links': ['issue_key', 'linked_issue_key', 'link_type'],
+    milestones: ['milestone_key', 'name', 'due_date', 'status', 'updated_at_utc', 'client_shareable'],
   },
   git: { commits: ['repository', 'commit_sha', 'committed_at_utc'] },
   confluence: { pages: ['page_id', 'title', 'url', 'updated_at_utc', 'summary', 'client_shareable'] },
@@ -557,11 +557,31 @@ function validateCsvRows(sourceType, dataset, headers, rows, statusMapping = {})
       return 'Jira sprints must contain one active sprint and unique IDs with valid timestamps.';
     }
   }
-  if (sourceType === 'jira' && dataset === 'sprint-scope'
-    && (!validTimestamps(['event_at_utc'])
-      || rows.some((row) => !['added', 'removed'].includes(row.event_type)
-        || !Number.isFinite(Number(row.story_points_at_event)) || Number(row.story_points_at_event) < 0))) {
-    return 'Sprint scope contains invalid events, estimates, or timestamps.';
+  if (sourceType === 'jira' && dataset === 'sprint-scope') {
+    const validPoints = (value) => value === '' || /^\d+(?:\.\d+)?$/.test(value);
+    if (rows.some((row) => !row.sprint_id || !row.issue_key
+      || !validUtcTimestamp(row.added_at_utc)
+      || (row.removed_at_utc && Date.parse(row.removed_at_utc) < Date.parse(row.added_at_utc))
+      || !validPoints(row.story_points_at_sprint_start)
+      || !validPoints(row.story_points_current))
+      || !validTimestamps(['removed_at_utc', 'completed_at_utc'])) {
+      return 'Sprint scope contains invalid identifiers, estimates, or timestamps.';
+    }
+    const intervals = new Map();
+    for (const row of rows) {
+      const key = `${row.sprint_id}|${row.issue_key}`;
+      if (!intervals.has(key)) intervals.set(key, []);
+      intervals.get(key).push([
+        Date.parse(row.added_at_utc),
+        row.removed_at_utc ? Date.parse(row.removed_at_utc) : Infinity,
+      ]);
+    }
+    for (const list of intervals.values()) {
+      list.sort((a, b) => a[0] - b[0]);
+      if (list.some((interval, index) => index > 0 && interval[0] < list[index - 1][1])) {
+        return 'Sprint scope contains overlapping membership intervals for an issue.';
+      }
+    }
   }
   if (sourceType === 'jira' && dataset === 'worklogs'
     && (!isUnique('worklog_id')
@@ -571,13 +591,18 @@ function validateCsvRows(sourceType, dataset, headers, rows, statusMapping = {})
         || Number(row.hours) < 0))) {
     return 'Jira worklogs contain duplicate IDs or invalid hours/timestamps.';
   }
-  if (sourceType === 'jira' && dataset === 'issue-links' && !isUnique('link_id')) {
-    return 'Jira issue links contain duplicate identifiers.';
+  if (sourceType === 'jira' && dataset === 'issue-links'
+    && rows.some((row) => !row.issue_key || !row.linked_issue_key || !row.link_type)) {
+    return 'Jira issue links must include issue keys and a link type.';
   }
-  if (sourceType === 'jira' && dataset === 'milestones'
-    && (!isUnique('milestone_id') || rows.some((row) =>
-      !['true', 'false'].includes(row.client_shareable) || !validDate(row.due_date_local)))) {
-    return 'Jira milestones contain duplicate IDs or invalid sharing/date values.';
+  if (sourceType === 'jira' && dataset === 'milestones') {
+    if (!isUnique('milestone_key')) return 'Jira milestones contain duplicate keys.';
+    if (rows.some((row) => !row.milestone_key || !row.status
+      || !['true', 'false'].includes(row.client_shareable)
+      || !validDate(row.due_date)
+      || !validUtcTimestamp(row.updated_at_utc))) {
+      return 'Jira milestones contain a missing status or invalid sharing/date/timestamp values.';
+    }
   }
   if (sourceType === 'git' && (!isUnique('commit_sha') || !validTimestamps(['committed_at_utc']))) {
     return 'Git commits contain duplicate hashes or invalid timestamps.';
