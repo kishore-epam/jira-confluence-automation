@@ -169,6 +169,56 @@ function validDate(value) {
   return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
 }
 
+function buildWindowsScheduledTaskConfig({
+  taskName = 'USF-PLAN Weekly Report Worker',
+  actionScript = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\run-local-report-worker.ps1',
+  startTime = '09:00',
+  dayOfWeek = 'MON',
+  timeZone = 'America/New_York',
+  account = process.env.USERNAME || 'SYSTEM',
+} = {}) {
+  if (timeZone !== 'America/New_York') {
+    throw new Error('The scheduled worker must use the America/New_York timezone.');
+  }
+  const normalizedDay = String(dayOfWeek || 'MON').toUpperCase();
+  if (!['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN'].includes(normalizedDay)) {
+    throw new Error('The scheduled worker day must be a valid weekday code.');
+  }
+  const match = /^([01]?\d|2[0-3]):([0-5]\d)$/.exec(String(startTime));
+  if (!match) {
+    throw new Error('The scheduled worker must use HH:mm format.');
+  }
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (hour === 9 && minute === 0 && normalizedDay !== 'MON') {
+    throw new Error('The worker schedule must be Monday at 09:00 America/New_York.');
+  }
+  return {
+    taskName,
+    type: 'weekly',
+    dayOfWeek: normalizedDay,
+    time: `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`,
+    timeZone,
+    account,
+    requiresSignedInSession: true,
+    missedTriggerBehavior: 'skip-missed-trigger',
+    runOncePerPeriod: true,
+    action: actionScript,
+    trigger: `Every ${normalizedDay} at ${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')} (${timeZone})`,
+  };
+}
+
+function validateScheduledTaskConfig(config) {
+  const built = buildWindowsScheduledTaskConfig(config);
+  if (built.dayOfWeek !== 'MON' || built.time !== '09:00' || built.timeZone !== 'America/New_York') {
+    throw new Error('The task must run every Monday at 09:00 America/New_York.');
+  }
+  if (built.missedTriggerBehavior !== 'skip-missed-trigger') {
+    throw new Error('Missed triggers must not replay automatically.');
+  }
+  return built;
+}
+
 function asStringList(value, field, errors) {
   if (!Array.isArray(value) || value.length > 20
     || value.some((entry) => typeof entry !== 'string' || entry.length < 1 || entry.length > 500)) {
@@ -1893,4 +1943,6 @@ module.exports = {
   discardUploadData,
   validateCsvRows,
   validateUpdate,
+  buildWindowsScheduledTaskConfig,
+  validateScheduledTaskConfig,
 };

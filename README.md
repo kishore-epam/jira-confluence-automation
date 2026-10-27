@@ -34,11 +34,26 @@ The backend startup wrapper applies local ACLs to `data\inputs`, `data\reports`,
 and `data\logs`. Keep all three services on this machine; do not bind them to a
 LAN interface.
 
+## Windows scheduled worker
+
+Use the Task Scheduler wrapper to install the weekly report worker in the
+project-manager session:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\register-local-worker-task.ps1 -WhatIf
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\register-local-worker-task.ps1
+```
+
+The task runs every Monday at 09:00 in `America/New_York`, without replaying
+missed triggers. The task reads the worker secret from the `USF-PLAN/WorkerToken`
+Credential Manager entry and fails safely if Docker, the loopback API, or the
+required Python/runtime prerequisites are unavailable.
+
 ## Current prototype boundary
 
 The UI supports saving PM update revisions, reviewing source readiness,
 submitting CSVs for contract validation, versioning basic reporting thresholds,
-and inspecting report history. The scheduled Python PowerPoint worker and its
-Windows Task Scheduler registration are not implemented yet; until then, report
-generation and review of a generated deck are unavailable. The UI intentionally
-does not offer a manual “run now” operation.
+and inspecting report history. The scheduled worker is now registered through the
+Windows Task Scheduler wrapper, but the Python report-generation implementation
+remains a separate runtime dependency. The UI intentionally does not offer a
+manual “run now” operation.

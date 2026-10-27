@@ -45,6 +45,32 @@ test('reporting period boundary uses local Monday across the daylight-saving tra
   assert.equal(reportingPeriodEnd(new Date('2026-11-02T14:00:00Z')), '2026-11-09');
 });
 
+test('the Windows worker task schedules Monday 9:00 a.m. ET and skips missed runs', () => {
+  const task = require('../src/server').buildWindowsScheduledTaskConfig({
+    taskName: 'USF-PLAN Weekly Report Worker',
+    actionScript: 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\run-local-report-worker.ps1',
+  });
+  assert.equal(task.dayOfWeek, 'MON');
+  assert.equal(task.time, '09:00');
+  assert.equal(task.timeZone, 'America/New_York');
+  assert.equal(task.missedTriggerBehavior, 'skip-missed-trigger');
+  assert.equal(task.requiresSignedInSession, true);
+  assert.equal(task.runOncePerPeriod, true);
+  assert.equal(task.action, 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\run-local-report-worker.ps1');
+
+  const valid = require('../src/server').validateScheduledTaskConfig({
+    dayOfWeek: 'mon',
+    startTime: '09:00',
+    timeZone: 'America/New_York',
+  });
+  assert.equal(valid.dayOfWeek, 'MON');
+  assert.throws(() => require('../src/server').validateScheduledTaskConfig({
+    dayOfWeek: 'tue',
+    startTime: '09:00',
+    timeZone: 'America/New_York',
+  }), /Monday at 09:00 America\/New_York/);
+});
+
 test('reporting period UTC boundaries preserve seven local calendar days across DST', () => {
   const springPeriod = reportingPeriodBounds('2026-03-09');
   const fallPeriod = reportingPeriodBounds('2026-11-02');
