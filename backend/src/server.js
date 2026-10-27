@@ -3,6 +3,7 @@
 const crypto = require('node:crypto');
 const { spawnSync } = require('node:child_process');
 const fs = require('node:fs/promises');
+const nodeFs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const express = require('express');
@@ -51,10 +52,10 @@ function safeEqual(left, right) {
   return leftBuffer.length === rightBuffer.length && crypto.timingSafeEqual(leftBuffer, rightBuffer);
 }
 
-function ensureReportArtifactPath(candidate) {
+function ensureReportArtifactPath(candidate, reportDirectory = REPORT_DIR) {
   if (!candidate) return null;
-  const absolute = path.resolve(REPORT_DIR, candidate);
-  const reportRoot = path.resolve(REPORT_DIR);
+  const reportRoot = path.resolve(reportDirectory);
+  const absolute = path.resolve(reportRoot, candidate);
   if (absolute !== reportRoot && !absolute.startsWith(`${reportRoot}${path.sep}`)) {
     throw Object.assign(new Error('Artifact path must stay within the local report directory.'), {
       statusCode: 400,
@@ -62,6 +63,94 @@ function ensureReportArtifactPath(candidate) {
     });
   }
   return absolute;
+}
+
+function reportArtifactNameForPeriod(periodEndLocalDate) {
+  return `USF-PLAN-weekly-status-${periodEndLocalDate}.pptx`;
+}
+
+async function atomicReplaceFile(sourcePath, destinationPath) {
+  const destination = path.resolve(destinationPath);
+  const tmpPath = `${destination}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  await fs.copyFile(sourcePath, tmpPath);
+  await fs.rename(tmpPath, destination);
+}
+
+async function promoteReportArtifact({
+  db = pool,
+  reportRunId,
+  projectId,
+  periodEndLocalDate,
+  stagedArtifactPath,
+  reportDirectory = REPORT_DIR,
+  now = new Date(),
+} = {}) {
+  const sourcePath = ensureReportArtifactPath(stagedArtifactPath, reportDirectory);
+  await fs.access(sourcePath);
+  const reportName = reportArtifactNameForPeriod(periodEndLocalDate);
+  const finalPath = path.join(path.resolve(reportDirectory), reportName);
+  if (sourcePath !== finalPath && nodeFs.existsSync(finalPath)) {
+    throw Object.assign(new Error('A dated artifact for this reporting period already exists.'), {
+      statusCode: 409,
+      code: 'ARTIFACT_ALREADY_EXISTS',
+    });
+  }
+
+  const destination = sourcePath !== finalPath ? finalPath : sourcePath;
+  if (sourcePath !== destination) {
+    await fs.rename(sourcePath, destination);
+  }
+
+  const latestPath = path.join(path.resolve(reportDirectory), 'latest.pptx');
+  await atomicReplaceFile(destination, latestPath);
+  await db.query(
+    `UPDATE projects
+     SET latest_report_run_id = $1
+     WHERE project_id = $2`,
+    [reportRunId, projectId],
+  );
+  return {
+    reportRunId,
+    artifactPath: destination,
+    latestArtifactPath: latestPath,
+    promotedAt: now.toISOString(),
+  };
+}
+
+async function purgeExpiredReportArtifacts({
+  db = pool,
+  reportDirectory = REPORT_DIR,
+  now = new Date(),
+} = {}) {
+  const results = await db.query(
+    `SELECT rr.report_run_id, rr.project_id, rr.artifact_path, rr.period_end, p.latest_report_run_id
+     FROM report_runs rr
+     INNER JOIN projects p ON p.project_id = rr.project_id
+     WHERE rr.status IN ('succeeded', 'partial')
+       AND rr.completed_at IS NOT NULL
+       AND rr.period_end <= $1::timestamptz - interval '1 year'
+     ORDER BY rr.period_end ASC`,
+    [now.toISOString()],
+  );
+
+  for (const run of results.rows) {
+    const artifactPath = run.artifact_path ? ensureReportArtifactPath(run.artifact_path, reportDirectory) : null;
+    if (artifactPath) {
+      await fs.rm(artifactPath, { force: true });
+    }
+    if (run.latest_report_run_id === run.report_run_id) {
+      const latestPath = path.join(path.resolve(reportDirectory), 'latest.pptx');
+      await fs.rm(latestPath, { force: true });
+      await db.query(
+        `UPDATE projects
+         SET latest_report_run_id = NULL
+         WHERE project_id = $1 AND latest_report_run_id = $2`,
+        [run.project_id, run.report_run_id],
+      );
+    }
+  }
+
+  return results.rowCount;
 }
 
 function errorResponse(res, status, code, message, details = []) {
@@ -628,6 +717,7 @@ async function completeReportRun({
   summary = null,
   artifactPath = null,
   now = new Date(),
+  reportDirectory = REPORT_DIR,
 } = {}) {
   const validFinalStates = new Set(['succeeded', 'partial', 'failed']);
   if (!validFinalStates.has(finalStatus)) {
@@ -637,7 +727,7 @@ async function completeReportRun({
     });
   }
   const active = await db.query(
-    `SELECT report_run_id, status, lease_expires_at, artifact_path, completed_at
+    `SELECT report_run_id, status, lease_expires_at, artifact_path, completed_at, started_at
      FROM report_runs WHERE report_run_id = $1`,
     [runId],
   );
@@ -645,6 +735,16 @@ async function completeReportRun({
     throw Object.assign(new Error('Report run not found.'), { statusCode: 404, code: 'REPORT_RUN_NOT_FOUND' });
   }
   const row = active.rows[0];
+  const details = await db.query(
+    `SELECT project_id, period_end FROM report_runs WHERE report_run_id = $1`,
+    [runId],
+  );
+  const projectRow = details.rowCount ? details.rows[0] : {};
+  const resolvedRow = {
+    ...row,
+    project_id: projectRow.project_id ?? row.project_id,
+    period_end: projectRow.period_end ?? row.period_end,
+  };
   if (row.status !== 'running') {
     return {
       reportRunId: row.report_run_id,
@@ -660,25 +760,74 @@ async function completeReportRun({
       code: 'CLAIM_EXPIRED',
     });
   }
-  const safeArtifact = ensureReportArtifactPath(artifactPath);
+
+  const newerRun = await db.query(
+    `SELECT report_run_id
+     FROM report_runs
+     WHERE project_id = $1 AND report_run_id <> $2
+       AND started_at > $3 AND status IN ('running', 'succeeded', 'partial')
+     ORDER BY started_at DESC, created_at DESC
+     LIMIT 1`,
+    [resolvedRow.project_id, runId, resolvedRow.started_at],
+  );
+  if (newerRun.rowCount) {
+    throw Object.assign(new Error('A newer report run already exists for this project and cannot be replaced.'), {
+      statusCode: 409,
+      code: 'RUN_NOT_LATEST',
+    });
+  }
+
+  if (finalStatus === 'failed') {
+    const updated = await db.query(
+      `UPDATE report_runs
+       SET status = $2,
+           completed_at = $3,
+           failure_code = $4,
+           failure_summary = $5,
+           last_heartbeat_at = $3,
+           lease_expires_at = $3
+       WHERE report_run_id = $1
+       RETURNING report_run_id, status, completed_at, failure_summary, artifact_path`,
+      [runId, finalStatus, now.toISOString(), 'REPORT_FAILED', summary],
+    );
+    return {
+      reportRunId: updated.rows[0].report_run_id,
+      status: updated.rows[0].status,
+      completedAt: updated.rows[0].completed_at,
+      artifactPath: updated.rows[0].artifact_path,
+      idempotent: false,
+    };
+  }
+
+  const safeArtifact = ensureReportArtifactPath(artifactPath, reportDirectory);
+  const artifactResult = await promoteReportArtifact({
+    db,
+    reportRunId: runId,
+    projectId: resolvedRow.project_id,
+    periodEndLocalDate: new Date(resolvedRow.period_end).toISOString().slice(0, 10),
+    stagedArtifactPath: safeArtifact,
+    reportDirectory,
+    now,
+  });
   const updated = await db.query(
     `UPDATE report_runs
      SET status = $2,
          completed_at = $3,
-         failure_code = $4,
+         failure_code = NULL,
          failure_summary = $5,
          artifact_path = $6,
          last_heartbeat_at = $3,
          lease_expires_at = $3
      WHERE report_run_id = $1
      RETURNING report_run_id, status, completed_at, failure_summary, artifact_path`,
-    [runId, finalStatus, now.toISOString(), finalStatus === 'failed' ? 'REPORT_FAILED' : null, summary, safeArtifact],
+    [runId, finalStatus, now.toISOString(), null, summary, artifactResult.artifactPath],
   );
   return {
     reportRunId: updated.rows[0].report_run_id,
     status: updated.rows[0].status,
     completedAt: updated.rows[0].completed_at,
     artifactPath: updated.rows[0].artifact_path,
+    latestArtifactPath: artifactResult.latestArtifactPath,
     idempotent: false,
   };
 }
@@ -1695,9 +1844,13 @@ async function start() {
   await fs.mkdir(REPORT_DIR, { recursive: true });
   await pool.query(await fs.readFile(schemaPath, 'utf8'));
   await purgeExpiredSourceFiles();
+  await purgeExpiredReportArtifacts();
   const cleanupTimer = setInterval(() => {
-    purgeExpiredSourceFiles().catch((error) => {
-      console.error(JSON.stringify({ event: 'source_retention_cleanup_failed', code: error.code || 'CLEANUP_FAILED' }));
+    Promise.all([
+      purgeExpiredSourceFiles(),
+      purgeExpiredReportArtifacts(),
+    ]).catch((error) => {
+      console.error(JSON.stringify({ event: 'retention_cleanup_failed', code: error.code || 'CLEANUP_FAILED' }));
     });
   }, SOURCE_CLEANUP_INTERVAL_MS);
   cleanupTimer.unref();
@@ -1731,6 +1884,8 @@ module.exports = {
   claimReportRun,
   heartbeatReportRun,
   completeReportRun,
+  promoteReportArtifact,
+  purgeExpiredReportArtifacts,
   sourceRetentionDeadline,
   validateSourceFreshnessAndCoverage,
   findCurrentActiveSprintStart,

@@ -3,6 +3,7 @@
 const { spawnSync } = require('node:child_process');
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { randomUUID } = require('node:crypto');
 const fs = require('node:fs/promises');
 const nodeFs = require('node:fs');
 const os = require('node:os');
@@ -29,6 +30,8 @@ const {
   claimReportRun,
   heartbeatReportRun,
   completeReportRun,
+  promoteReportArtifact,
+  purgeExpiredReportArtifacts,
 } = require('../src/server');
 
 test('reporting period stays open through the Monday 8:30 a.m. Eastern PM deadline', () => {
@@ -571,6 +574,12 @@ test('report-run lifecycle claims, heartbeats, and completes a running job', asy
           }],
         };
       }
+      if (normalized.includes('SELECT project_id, period_end FROM report_runs WHERE report_run_id = $1')) {
+        return {
+          rowCount: 1,
+          rows: [{ project_id: 11, period_end: '2026-11-02T14:00:00.000Z' }],
+        };
+      }
       return { rowCount: 0, rows: [] };
     },
   };
@@ -586,15 +595,21 @@ test('report-run lifecycle claims, heartbeats, and completes a running job', asy
   const heartbeat = await heartbeatReportRun({ db: fakeDb, runId: run.reportRunId, now: new Date('2026-11-02T14:00:00Z') });
   assert.equal(heartbeat.status, 'running');
 
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'usf-plan-lifecycle-'));
+  const stagedPath = path.join(tempDir, '2026-11-02-report.pptx');
+  await fs.writeFile(stagedPath, 'report-bytes');
+
   const complete = await completeReportRun({
     db: fakeDb,
     runId: run.reportRunId,
     finalStatus: 'succeeded',
-    artifactPath: '2026-11-02-report.pptx',
+    artifactPath: stagedPath,
     now: new Date('2026-11-02T14:01:00Z'),
+    reportDirectory: tempDir,
   });
   assert.equal(complete.status, 'succeeded');
-  assert.match(complete.artifactPath, /2026-11-02-report\.pptx/);
+  assert.match(complete.artifactPath, /USF-PLAN-weekly-status-2026-11-02\.pptx/);
+  await fs.rm(tempDir, { recursive: true, force: true });
 });
 
 test('report-run lifecycle rejects duplicate claims and expired or invalid transitions', async () => {
@@ -619,6 +634,12 @@ test('report-run lifecycle rejects duplicate claims and expired or invalid trans
         return {
           rowCount: 1,
           rows: [{ report_run_id: params[0], status: 'running', lease_expires_at: '2026-11-02T15:00:00.000Z' }],
+        };
+      }
+      if (normalized.includes('SELECT project_id, period_end FROM report_runs WHERE report_run_id = $1')) {
+        return {
+          rowCount: 1,
+          rows: [{ project_id: 11, period_end: '2026-11-02T14:00:00.000Z' }],
         };
       }
       if (normalized.includes('UPDATE report_runs SET last_heartbeat_at = $2, lease_expires_at = $3')) {
@@ -714,7 +735,7 @@ test('six-slide report deck is deterministic and uses the required ordered secti
   assert.match(slides[0].body.join(' '), /RAG status: amber/i);
   assert.match(slides[5].body.join(' '), /Next-week priorities/i);
 
-  const tmpDir = path.join(os.tmpdir(), `usf-plan-pptx-${Date.now()}`);
+  const tmpDir = path.join(os.tmpdir(), `usf-plan-pptx-${randomUUID()}`);
   const firstPath = path.join(tmpDir, 'report-a.pptx');
   const secondPath = path.join(tmpDir, 'report-b.pptx');
   const firstReport = generatePowerPointReport(snapshot, firstPath);
@@ -729,6 +750,107 @@ test('six-slide report deck is deterministic and uses the required ordered secti
   assert.match(slideCount.stdout, /6/);
   assert.equal(nodeFs.existsSync(firstPath), true);
   await fs.rm(tmpDir, { recursive: true, force: true });
+});
+
+test('successful report completion promotes the dated artifact and updates the latest pointer', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'usf-plan-artifact-'));
+  const stagedPath = path.join(tempDir, 'staged-run-1.pptx');
+  await fs.writeFile(stagedPath, 'binary-report');
+
+  const fakeDb = {
+    async query(sql, params = []) {
+      const normalized = String(sql).replace(/\s+/g, ' ').trim();
+      if (normalized.includes('SELECT report_run_id, status, lease_expires_at, artifact_path, completed_at, started_at')) {
+        return {
+          rowCount: 1,
+          rows: [{
+            report_run_id: 'run-1',
+            status: 'running',
+            lease_expires_at: '2999-01-01T00:00:00.000Z',
+            artifact_path: null,
+            completed_at: null,
+            started_at: '2026-11-02T14:00:00.000Z',
+          }],
+        };
+      }
+      if (normalized.includes('SELECT project_id, period_end FROM report_runs WHERE report_run_id = $1')) {
+        return {
+          rowCount: 1,
+          rows: [{ project_id: 11, period_end: '2026-11-02T14:00:00.000Z' }],
+        };
+      }
+      if (normalized.includes('SELECT report_run_id FROM report_runs WHERE project_id = $1 AND report_run_id <> $2')) {
+        return { rowCount: 0, rows: [] };
+      }
+      if (normalized.includes('UPDATE projects SET latest_report_run_id = $1')) {
+        return { rowCount: 1, rows: [] };
+      }
+      if (normalized.includes('UPDATE report_runs SET status = $2')) {
+        return {
+          rowCount: 1,
+          rows: [{
+            report_run_id: params[0],
+            status: params[1],
+            completed_at: params[2],
+            failure_summary: params[4],
+            artifact_path: params[5],
+          }],
+        };
+      }
+      return { rowCount: 0, rows: [] };
+    },
+  };
+
+  const complete = await completeReportRun({
+    db: fakeDb,
+    runId: 'run-1',
+    finalStatus: 'succeeded',
+    artifactPath: stagedPath,
+    now: new Date('2026-11-02T14:01:00Z'),
+    reportDirectory: tempDir,
+  });
+
+  assert.equal(complete.status, 'succeeded');
+  assert.equal(path.basename(complete.artifactPath), 'USF-PLAN-weekly-status-2026-11-02.pptx');
+  assert.equal(nodeFs.existsSync(path.join(tempDir, 'latest.pptx')), true);
+  assert.equal(nodeFs.existsSync(stagedPath), false);
+  await fs.rm(tempDir, { recursive: true, force: true });
+});
+
+test('expired report artifacts are removed and the latest pointer is cleared', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'usf-plan-artifact-retention-'));
+  const datedPath = path.join(tempDir, 'USF-PLAN-weekly-status-2026-11-02.pptx');
+  const latestPath = path.join(tempDir, 'latest.pptx');
+  await fs.writeFile(datedPath, 'retained-artifact');
+  await fs.writeFile(latestPath, 'latest-artifact');
+
+  const fakeDb = {
+    async query(sql, params = []) {
+      const normalized = String(sql).replace(/\s+/g, ' ').trim();
+      if (normalized.includes('SELECT rr.report_run_id, rr.project_id, rr.artifact_path, rr.period_end, p.latest_report_run_id')) {
+        return {
+          rowCount: 1,
+          rows: [{
+            report_run_id: 'run-1',
+            project_id: 11,
+            artifact_path: datedPath,
+            period_end: '2026-11-02T14:00:00.000Z',
+            latest_report_run_id: 'run-1',
+          }],
+        };
+      }
+      if (normalized.includes('UPDATE projects SET latest_report_run_id = NULL')) {
+        return { rowCount: 1, rows: [] };
+      }
+      return { rowCount: 0, rows: [] };
+    },
+  };
+
+  const removed = await purgeExpiredReportArtifacts({ db: fakeDb, reportDirectory: tempDir, now: new Date('2027-11-03T00:00:00Z') });
+  assert.equal(removed, 1);
+  assert.equal(nodeFs.existsSync(datedPath), false);
+  assert.equal(nodeFs.existsSync(latestPath), false);
+  await fs.rm(tempDir, { recursive: true, force: true });
 });
 
 test('capacity import returns an aggregate without retaining the person key', () => {

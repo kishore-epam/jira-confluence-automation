@@ -100,6 +100,9 @@ CREATE TABLE IF NOT EXISTS report_runs (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+ALTER TABLE projects
+    ADD COLUMN IF NOT EXISTS latest_report_run_id UUID REFERENCES report_runs(report_run_id);
+
 CREATE TABLE IF NOT EXISTS report_run_inputs (
     report_run_id UUID NOT NULL REFERENCES report_runs(report_run_id),
     source_input_id UUID NOT NULL,
