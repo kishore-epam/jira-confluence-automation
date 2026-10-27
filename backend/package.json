@@ -6,7 +6,15 @@
   "engines": {
     "node": "24.x"
   },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test"
+  },
   "dependencies": {
-    "express": "5.3.0"
+    "csv-parse": "5.6.0",
+    "express": "5.3.0",
+    "multer": "2.0.2",
+    "pg": "8.16.3"
   }
 }
