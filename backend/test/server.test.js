@@ -3,7 +3,7 @@
 const { spawnSync } = require('node:child_process');
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { randomUUID } = require('node:crypto');
+const { createHash, randomUUID } = require('node:crypto');
 const fs = require('node:fs/promises');
 const nodeFs = require('node:fs');
 const os = require('node:os');
@@ -733,14 +733,10 @@ test('six-slide report deck is deterministic and uses the required ordered secti
       removals: ['USF-8 -2'],
       caveats: ['Estimate history for one issue is partial.'],
     },
-    milestones: [
-      { milestoneKey: 'M-1', status: 'on_track', summary: 'Release candidate is on track.' },
-    ],
-    issues: [
-      { issueKey: 'USF-21', status: 'in_progress', age: '7 business days', summary: 'Needs dependency confirmation.' },
-    ],
-    blockers: [{ issueKey: 'USF-21', status: 'blocked', summary: 'Waiting on API contract sign-off.' }],
-    decisions: [{ issueKey: 'Decision', status: 'open', summary: 'Need sponsor review for scope change.' }],
+    milestones: ['M-1: on_track — Release candidate is on track.'],
+    issues: ['USF-21: in_progress (7 business days) — Needs dependency confirmation.'],
+    blockers: ['USF-21: Waiting on API contract sign-off.'],
+    decisions: ['Decision: Need sponsor review for scope change.'],
     capacity: { plannedHours: 32.5, actualHours: 28.0 },
     gitActivity: { count: 14 },
     sourceWarnings: ['Jira sprint-scope coverage is partial.'],
@@ -765,15 +761,48 @@ test('six-slide report deck is deterministic and uses the required ordered secti
   const firstPath = path.join(tmpDir, 'report-a.pptx');
   const secondPath = path.join(tmpDir, 'report-b.pptx');
   const firstReport = generatePowerPointReport(snapshot, firstPath);
-  const secondReport = generatePowerPointReport(snapshot, secondPath);
   assert.equal(firstReport, firstPath);
+  await new Promise((resolve) => setTimeout(resolve, 2100));
+  const secondReport = generatePowerPointReport(snapshot, secondPath);
   assert.equal(secondReport, secondPath);
-  assert.equal(nodeFs.readFileSync(firstPath).equals(nodeFs.readFileSync(secondPath)), true);
+  const firstBytes = nodeFs.readFileSync(firstPath);
+  const secondBytes = nodeFs.readFileSync(secondPath);
+  assert.equal(firstBytes.equals(secondBytes), true);
+  assert.equal(
+    createHash('sha256').update(firstBytes).digest('hex'),
+    createHash('sha256').update(secondBytes).digest('hex'),
+  );
 
   const python = process.platform === 'win32' ? 'py' : 'python3';
-  const slideCount = spawnSync(python, ['-c', `from pptx import Presentation; prs = Presentation(r'${firstPath}'); print(len(prs.slides))`], { encoding: 'utf8' });
-  assert.equal(Number(slideCount.stdout.trim()), 6);
-  assert.match(slideCount.stdout, /6/);
+  const slideDetails = spawnSync(python, ['-c', `
+import json
+import sys
+from pptx import Presentation
+
+prs = Presentation(sys.argv[1])
+print(json.dumps([
+    [shape.text for shape in slide.shapes if getattr(shape, 'has_text_frame', False)]
+    for slide in prs.slides
+]))
+`, firstPath], { encoding: 'utf8' });
+  assert.equal(slideDetails.status, 0, slideDetails.stderr);
+  const slidesInDeck = JSON.parse(slideDetails.stdout);
+  assert.equal(slidesInDeck.length, 6);
+  assert.deepEqual(slidesInDeck.map((slide) => slide[0]), [
+    'Executive summary',
+    'Sprint progress and scope',
+    'Milestones and forecast availability',
+    'Issues, blockers, dependencies, and decisions',
+    'Aggregate capacity and Git activity',
+    'Next-week priorities and data quality',
+  ]);
+  assert.match(slidesInDeck[0].join(' '), /RAG status: amber/i);
+  assert.match(slidesInDeck[1].join(' '), /Committed points: 31/);
+  assert.match(slidesInDeck[2].join(' '), /Release candidate is on track/);
+  assert.match(slidesInDeck[3].join(' '), /Waiting on API contract sign-off/);
+  assert.match(slidesInDeck[4].join(' '), /Planned capacity: 32\.5 hours/);
+  assert.match(slidesInDeck[5].join(' '), /Jira sprint-scope coverage is partial/);
+  assert.match(slidesInDeck[5].join(' '), /Complete dependency sign-off/);
   assert.equal(nodeFs.existsSync(firstPath), true);
   await fs.rm(tmpDir, { recursive: true, force: true });
 });

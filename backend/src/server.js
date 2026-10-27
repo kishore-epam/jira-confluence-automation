@@ -1319,7 +1319,10 @@ function generatePowerPointReport(snapshot, outputPath) {
   const script = `
 import datetime
 import json
+import os
 import sys
+import tempfile
+import zipfile
 from pathlib import Path
 from pptx import Presentation
 from pptx.util import Inches, Pt
@@ -1352,6 +1355,26 @@ for slide_def in slides:
         if p.runs:
             p.runs[0].font.size = Pt(18)
 prs.save(out_path)
+
+fd, normalized_path = tempfile.mkstemp(prefix=out_path.name + '.normalized-', dir=out_path.parent)
+os.close(fd)
+try:
+    with zipfile.ZipFile(out_path, 'r') as source, zipfile.ZipFile(
+        normalized_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9
+    ) as normalized:
+        normalized.comment = b''
+        for name in sorted(source.namelist()):
+            entry = zipfile.ZipInfo(name, date_time=(2000, 1, 1, 0, 0, 0))
+            entry.compress_type = zipfile.ZIP_DEFLATED
+            entry.create_system = 3
+            entry.external_attr = 0o100600 << 16
+            entry.extra = b''
+            entry.comment = b''
+            normalized.writestr(entry, source.read(name), compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
+    os.replace(normalized_path, out_path)
+finally:
+    if os.path.exists(normalized_path):
+        os.unlink(normalized_path)
 `;
   const result = spawnSync(pythonExecutable, ['-c', script, JSON.stringify(slides), reportPath], { encoding: 'utf8' });
   if (result.status !== 0) {
