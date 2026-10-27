@@ -346,7 +346,7 @@ function parseCsv(buffer) {
   return { headers, records };
 }
 
-function validateCsvRows(sourceType, dataset, headers, rows) {
+function validateCsvRows(sourceType, dataset, headers, rows, statusMapping = {}) {
   const required = CSV_CONTRACTS[sourceType]?.[dataset];
   if (!required) return 'This source and dataset are not supported.';
   const unknown = headers.filter((header) => !required.includes(header));
@@ -367,6 +367,12 @@ function validateCsvRows(sourceType, dataset, headers, rows) {
   const validTimestamps = (fields) => rows.every((row) =>
     fields.every((field) => !row[field] || validUtcTimestamp(row[field])));
   if (sourceType === 'jira' && dataset === 'issues') {
+    const mapping = statusMapping && typeof statusMapping === 'object' && !Array.isArray(statusMapping)
+      ? statusMapping
+      : {};
+    if (rows.some((row) => !Object.hasOwn(mapping, row.status) || mapping[row.status] !== row.status_category)) {
+      return 'Jira issues contain an unknown or mismatched status/category mapping.';
+    }
     if (!isUnique('issue_key')
       || rows.some((row) => !['todo', 'in_progress', 'done'].includes(row.status_category)
         || !['true', 'false'].includes(row.client_shareable)
@@ -456,9 +462,23 @@ app.post('/api/v1/source-inputs/:sourceType/:dataset', upload.single('file'), as
 
     let parsed;
     let validation;
+    let issueStatusMapping = {};
+    if (sourceType === 'jira' && dataset === 'issues') {
+      const settings = await pool.query(
+        `SELECT status_mapping
+         FROM reporting_settings
+         WHERE project_id = (SELECT project_id FROM projects WHERE project_key = $1)
+         ORDER BY settings_version_id DESC LIMIT 1`,
+        [PROJECT_KEY],
+      );
+      if (!settings.rowCount) {
+        return errorResponse(res, 503, 'STATUS_MAPPING_UNAVAILABLE', 'A configured Jira status mapping is required to validate issue exports.');
+      }
+      issueStatusMapping = settings.rows[0].status_mapping;
+    }
     try {
       parsed = parseCsv(req.file.buffer);
-      validation = validateCsvRows(sourceType, dataset, parsed.headers, parsed.records);
+      validation = validateCsvRows(sourceType, dataset, parsed.headers, parsed.records, issueStatusMapping);
     } catch (error) {
       validation = error instanceof TypeError ? 'CSV must be valid UTF-8.' : 'CSV could not be parsed safely.';
     }

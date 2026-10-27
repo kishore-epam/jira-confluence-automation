@@ -47,6 +47,68 @@ test('Jira sprint CSV must have exactly one active sprint', () => {
   assert.match(validateCsvRows('jira', 'sprints', headers, []), /at least one data row/i);
 });
 
+const jiraIssueHeaders = [
+  'issue_key',
+  'title',
+  'status',
+  'status_category',
+  'updated_at_utc',
+  'in_progress_since_utc',
+  'story_points',
+  'issue_type',
+  'client_shareable',
+];
+
+const jiraStatusMapping = {
+  'To Do': 'todo',
+  'In Progress': 'in_progress',
+  Done: 'done',
+};
+
+function jiraIssue(status, statusCategory) {
+  return {
+    issue_key: 'USF-1',
+    title: 'Example issue',
+    status,
+    status_category: statusCategory,
+    updated_at_utc: '2026-10-26T12:00:00Z',
+    in_progress_since_utc: '',
+    story_points: '3',
+    issue_type: 'Story',
+    client_shareable: 'true',
+  };
+}
+
+test('Jira issue accepts a status/category pair that matches the configured mapping', () => {
+  assert.equal(validateCsvRows(
+    'jira',
+    'issues',
+    jiraIssueHeaders,
+    [jiraIssue('In Progress', 'in_progress')],
+    jiraStatusMapping,
+  ), null);
+});
+
+test('Jira issue rejects a known status with a mismatched category', () => {
+  assert.match(validateCsvRows(
+    'jira',
+    'issues',
+    jiraIssueHeaders,
+    [jiraIssue('In Progress', 'done')],
+    jiraStatusMapping,
+  ), /mismatched status\/category mapping/i);
+});
+
+test('Jira issue rejects a status that is not configured in the mapping', () => {
+  assert.match(validateCsvRows(
+    'jira',
+    'issues',
+    jiraIssueHeaders,
+    [jiraIssue('Blocked', 'in_progress')],
+    jiraStatusMapping,
+  ), /unknown or mismatched status\/category mapping/i);
+});
+
 test('capacity import returns an aggregate without retaining the person key', () => {
   const result = validateCsvRows('capacity', 'allocations',
     ['person_key', 'week_start', 'planned_hours'],
