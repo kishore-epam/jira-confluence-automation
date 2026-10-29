@@ -59,7 +59,8 @@ function linesToList(value) {
 }
 
 function listToLines(value) {
-  return Array.isArray(value) ? value.join('\n') : '';
+  if (Array.isArray(value)) return value.join('\n');
+  return typeof value === 'string' ? value : '';
 }
 
 export default function App() {
